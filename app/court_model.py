@@ -1,22 +1,28 @@
 from dataclasses import dataclass
 
 @dataclass
-class Line:
-    start: tuple[int, int]
-    end: tuple[int, int]
-
+class CourtCorners:
+    top_left: tuple | None = None
+    top_right: tuple | None = None
+    bottom_left: tuple | None = None
+    bottom_right: tuple | None = None
 
 @dataclass
 class CourtModel:
-    baseline_near: Line | None = None
-    baseline_far: Line | None = None
+    # Linhas de fundo
+    baseline_near: tuple | None = None
+    baseline_far: tuple | None = None
 
-    left_sideline: Line | None = None
-    right_sideline: Line | None = None
+    # Linhas laterais
+    left_sideline: tuple | None = None
+    right_sideline: tuple | None = None
 
-    service_line_near: Line | None = None
-    service_line_far: Line | None = None
+    # Linhas de serviço
+    near_service_line: tuple | None = None
+    far_service_line: tuple | None = None
 
-    center_service_line: Line | None = None
+    # Linha central de serviço
+    center_service_line: tuple | None = None
 
-    net: Line | None = None
+    # Rede
+    net: tuple | None = None

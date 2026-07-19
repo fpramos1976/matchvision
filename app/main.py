@@ -1,6 +1,7 @@
 import cv2
 from video_reader import open_video
 from court_detector import detect_court_lines
+from manual_calibration import start_calibration
 
 
 def main():
@@ -14,6 +15,17 @@ def main():
 
     print("Pronto para começar a processar os frames!")
 
+    # Lê o primeiro frame
+    ret, frame = video.read()
+
+    if not ret:
+        print("Erro ao ler o primeiro frame.")
+        video.release()
+        return
+
+    # Inicia a calibração manual
+    start_calibration(frame)
+
     while True:
         ret, frame = video.read()
 
@@ -24,11 +36,11 @@ def main():
         # O detector agora devolve o frame com as linhas desenhadas e o Canny
         frame_com_linhas, edges = detect_court_lines(frame)
 
-        # Exibe o resultado do Canny (para acompanharmos o que ele vê)
+        # Exibe o resultado do Canny
         if edges is not None:
             cv2.imshow("MatchVision - Bordas Canny", edges)
 
-        # Exibe o frame real com as linhas verdes detectadas dinamicamente
+        # Exibe o frame com as linhas detectadas
         if frame_com_linhas is not None:
             cv2.imshow("MatchVision - Linhas Detectadas", frame_com_linhas)
 
