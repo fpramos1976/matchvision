@@ -1,7 +1,7 @@
 import cv2
-from video_reader import open_video
-from court_detector import detect_court_lines
-from manual_calibration import start_calibration
+from app.utils.video_reader import open_video
+from app.calibration.court_detector import detect_court_lines
+from app.calibration.manual_calibration import start_calibration
 
 
 def main():
