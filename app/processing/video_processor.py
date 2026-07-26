@@ -1,9 +1,10 @@
 import cv2
 
+from app import configuration
 from app.utils.video_reader import open_video
 from app.calibration.court_detector import detect_court_lines
-from app.calibration.manual_calibration import start_calibration
-
+from app.calibration.manual_calibration import ManualCalibration
+from app.utils.configuration import get_match_configuration
 
 class VideoProcessor:
     def __init__(self, video_path: str):
@@ -11,6 +12,12 @@ class VideoProcessor:
 
     def run(self):
         print("Hello from MatchVision!")
+
+        configuration = get_match_configuration()
+
+        print(f"Tipo da partida: {configuration.court_type.value}")
+
+        match_config = get_match_configuration()
 
         video = open_video(self.video_path)
 
@@ -29,7 +36,11 @@ class VideoProcessor:
             return
 
         # Inicia a calibração manual
-        start_calibration(frame)
+
+        calibration = ManualCalibration(frame, configuration)
+        points = calibration.run()
+        print(f"Pontos de calibração selecionados: {points}")
+
 
         while True:
             ret, frame = video.read()

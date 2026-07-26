@@ -36,6 +36,13 @@ def detect_court_lines(frame):
         minLineLength=40,
         maxLineGap=15,
     )
+    ## Primeiro teste
+    print("=" * 50)
+
+    if lines is None:
+        print("Nenhuma linha encontrada.")
+    else:
+        print(f"Linhas encontradas pela Hough: {len(lines)}")
 
     # 5. Filtragem Geométrica Restrita
     if lines is not None:
@@ -45,6 +52,12 @@ def detect_court_lines(frame):
             # Calcula comprimento e ângulo
             length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
             angle = np.abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+
+            ## Segundo Teste
+            print(
+                f"Ângulo: {angle:6.2f}° | "
+                f"Comprimento: {length:6.1f}"
+)
 
             # Filtro de inclinação rígido para esta perspectiva
             is_horizontal = angle < 5 or angle > 175
