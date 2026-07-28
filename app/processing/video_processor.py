@@ -4,10 +4,12 @@ from app.utils.video_reader import open_video
 from app.utils.configuration import get_match_configuration
 
 from app.calibration.manual_calibration import ManualCalibration
-from app.calibration.homography import Homography
+from app.geometry.homography import Homography
+from app.models.court_model import CourtModel
 
 # Temporário (iremos remover quando a Bird's-Eye View estiver pronta)
 from app.calibration.court_detector import detect_court_lines
+
 
 
 class VideoProcessor:
@@ -61,11 +63,21 @@ class VideoProcessor:
         # ==========================================
         # Homografia
         # ==========================================
-        homography = Homography(points, configuration)
+        # ==========================================
+        # Homografia
+        # ==========================================
+        court_model = CourtModel()
 
-        homography.compute()
+        homography = Homography(
+            image_points=points,
+            court_model=court_model,
+        )
+
+        H = homography.compute()
 
         print("Homografia calculada!")
+        print("Matriz da homografia:")
+        print(H)
 
         # ==========================================
         # Reinicia o vídeo
@@ -81,6 +93,8 @@ class VideoProcessor:
             return
 
         print("Vídeo reaberto para processamento.")
+        print(f"Frame atual: {video.get(cv2.CAP_PROP_POS_FRAMES)}")
+        print(f"Total de frames: {video.get(cv2.CAP_PROP_FRAME_COUNT)}")
 
         # ==========================================
         # Processamento
@@ -92,6 +106,7 @@ class VideoProcessor:
             contador += 1
 
             ret, frame = video.read()
+            print(f"read() retornou: {ret}")
 
             if not ret:
                 print("Fim do vídeo.")
@@ -100,8 +115,32 @@ class VideoProcessor:
             # Bird's-Eye View (por enquanto devolve o frame original)
             bird_view = homography.transform(frame)
 
+            # ==========================================
+            # Teste da Homografia - Centro da quadra
+            # ==========================================
+
+            court_center = (
+                court_model.width / 2,
+                court_model.length / 2,
+            )
+
+            center_pixel = homography.transform_point(court_center)
+
+            cv2.circle(
+                frame,
+                center_pixel,
+                10,
+                (0, 0, 255),
+                -1,
+            )
+
+            print(f"Centro da quadra: {court_center}")
+            print(f"Pixel projetado: {center_pixel}")
+
             # Detector antigo (apenas para comparação)
             frame_com_linhas, edges = detect_court_lines(frame)
+            print(f"Frame {contador}")
+
 
             # Janelas
             cv2.imshow("Original", frame)
@@ -115,7 +154,7 @@ class VideoProcessor:
             if edges is not None:
                 cv2.imshow("Bordas Canny", edges)
 
-            tecla = cv2.waitKey(30) & 0xFF
+            tecla = cv2.waitKey(0) & 0xFF
 
             if tecla == ord("q"):
                 print("Processamento interrompido pelo usuário.")

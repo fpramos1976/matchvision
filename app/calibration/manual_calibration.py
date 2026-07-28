@@ -1,4 +1,5 @@
 import cv2
+from app.models.court_corners import CourtCorners
 
 
 class ManualCalibration:
@@ -103,8 +104,14 @@ class ManualCalibration:
 
             if key == ord("q"):
                 print("Calibração cancelada.")
-                break
+                cv2.destroyWindow(self.window_name)
+                return None
 
         cv2.destroyWindow(self.window_name)
 
-        return self.points
+        return CourtCorners(
+            top_left=self.points[0],
+            top_right=self.points[1],
+            bottom_right=self.points[2],
+            bottom_left=self.points[3],
+        )
