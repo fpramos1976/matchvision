@@ -85,14 +85,53 @@ class CourtModel:
             (self.width, self.net_y),
         )
 
+    @property
+    def singles_left_sideline(self):
+        """
+        Linha lateral esquerda da quadra de simples.
+        """
+
+        x = (self.width - self.singles_width) / 2
+
+        return (
+            (x, 0.0),
+            (x, self.length),
+        )
+
+
+    @property
+    def singles_right_sideline(self):
+        """
+        Linha lateral direita da quadra de simples.
+        """
+
+        x = (
+            (self.width - self.singles_width) / 2
+            + self.singles_width
+        )
+
+        return (
+            (x, 0.0),
+            (x, self.length),
+        )
+
     def get_lines(self):
         return [
+            # Linhas externas da quadra de duplas
             self.baseline_far,
             self.baseline_near,
             self.left_sideline,
             self.right_sideline,
+
+            # Linhas laterais da quadra de simples
+            self.singles_left_sideline,
+            self.singles_right_sideline,
+
+            # Linhas de serviço
             self.near_service_line,
             self.far_service_line,
             self.center_service_line,
+
+            # Rede
             self.net,
         ]
