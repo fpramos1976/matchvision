@@ -9,7 +9,7 @@ from app.models.court_model import CourtModel
 
 # Temporário (iremos remover quando a Bird's-Eye View estiver pronta)
 from app.calibration.court_detector import detect_court_lines
-
+from app.visualization.court_map import CourtMap
 
 
 class VideoProcessor:
@@ -74,7 +74,15 @@ class VideoProcessor:
         # ==========================================
         # Homografia
         # ==========================================
-        court_model = CourtModel()
+        court_model = CourtModel(
+            width=configuration.court_type.value["width"],
+            length=configuration.court_type.value["length"],
+        )
+
+        court_map = CourtMap(
+            court_model=court_model,
+        )
+
 
         homography = Homography(
             image_points=points,
@@ -121,7 +129,7 @@ class VideoProcessor:
                 break
 
             # Bird's-Eye View (por enquanto devolve o frame original)
-            bird_view = homography.transform(frame)
+            bird_view = court_map.create()
 
             # ==========================================
             # Teste da Homografia - Centro da quadra
