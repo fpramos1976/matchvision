@@ -37,6 +37,14 @@ class VideoProcessor:
 
         print(f"Total de frames: {int(video.get(cv2.CAP_PROP_FRAME_COUNT))}")
         print(f"FPS: {video.get(cv2.CAP_PROP_FPS):.2f}")
+        fps = video.get(cv2.CAP_PROP_FPS)
+
+        if fps <= 0:
+            fps = 30
+
+        frame_delay = max(1, int(1000 / fps))
+
+        print(f"Tempo entre frames: {frame_delay} ms")
 
         # ==========================================
         # Primeiro frame (calibração)
@@ -154,7 +162,7 @@ class VideoProcessor:
             if edges is not None:
                 cv2.imshow("Bordas Canny", edges)
 
-            tecla = cv2.waitKey(0) & 0xFF
+            tecla = cv2.waitKey(frame_delay) & 0xFF
 
             if tecla == ord("q"):
                 print("Processamento interrompido pelo usuário.")
