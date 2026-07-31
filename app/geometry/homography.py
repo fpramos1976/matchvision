@@ -11,8 +11,14 @@ class Homography:
         self.inverse_matrix = None
 
     def compute(self):
-
-        world_points = np.float32(self.court_model.corners)
+        # Definindo explicitamente as coordenadas do mundo (metros)
+        # na MESMA ordem exata de image_points
+        world_points = np.float32([
+            [0.0, 0.0],                         # top_left
+            [self.court_model.width, 0.0],      # top_right
+            [self.court_model.width, self.court_model.length], # bottom_right
+            [0.0, self.court_model.length]      # bottom_left
+        ])
 
         image_points = np.float32([
             self.image_points.top_left,
@@ -107,3 +113,24 @@ class Homography:
         )
 
         return bird_view
+
+    def transform_point_to_world(self, point):
+        # Converte um ponto da imagem (pixels) para a posição real na quadra (metros).
+       
+        if self.inverse_matrix is None:
+            raise ValueError("A homografia ainda não foi calculada.")
+
+        image_point = np.array(
+            [[[point[0], point[1]]]],
+            dtype=np.float32,
+        )
+
+        world_point = cv2.perspectiveTransform(
+            image_point,
+            self.inverse_matrix,
+        )
+
+        x = float(world_point[0][0][0])
+        y = float(world_point[0][0][1])
+
+        return (x, y)
