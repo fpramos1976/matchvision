@@ -6,10 +6,12 @@ import numpy as np
 class BallDetector:
     """
     Detector de bola de ténis robusto com:
-    1. Filtro HSV para bola amarela.
+    1. Filtro HSV para bola amarela (tolerante a sombras).
     2. Motion Mask (diferença de frames).
-    3. Blacklist de pontos estáticos (elimina linhas brancas e bolas no solo).
-    4. Rastreio e suavização via Filtro de Kalman.
+    3. Blacklist de pontos estáticos (elimina linhas brancas e ruídos).
+    4. Restrições geométricas (Aspect Ratio e Circularidade).
+    5. Deteção de Bounce (Ressalto no solo IN/OUT).
+    6. Rastreio e suavização via Filtro de Kalman.
     """
 
     def __init__(self, max_buffer=30):
@@ -31,6 +33,9 @@ class BallDetector:
         # Posições bloqueadas por serem estáticas (linhas, brilhos fixos, etc.)
         self.blocked_static_points = []
 
+        # Histórico de ressaltos para a vista 2D: [(world_pos, is_in), ...]
+        self.bounces = []
+
         # ---------------------------------------------------------
         # Filtro de Kalman
         # ---------------------------------------------------------
@@ -45,17 +50,18 @@ class BallDetector:
             dtype=np.float32,
         )
 
+        # Ajuste de ruído do processo para acompanhar acelerações bruscas no impacto
         self.kalman.processNoiseCov = (
             np.array(
                 [
                     [1, 0, 0, 0],
                     [0, 1, 0, 0],
-                    [0, 0, 4, 0],
-                    [0, 0, 0, 4],
+                    [0, 0, 8, 0],
+                    [0, 0, 0, 8],
                 ],
                 dtype=np.float32,
             )
-            * 0.03
+            * 0.05
         )
 
         self.kalman.measurementNoiseCov = (
@@ -74,8 +80,50 @@ class BallDetector:
         self.kalman.statePre = np.zeros((4, 1), dtype=np.float32)
         self.kalman.statePost = np.zeros((4, 1), dtype=np.float32)
 
+    def check_bounce(self, court_model):
+        """
+        Analisa o histórico recente de posições (trajectory_world) para identificar
+        uma mudança na trajetória (ressalto no solo) e determina se foi IN ou OUT.
+        """
+        valid_points = [p for p in self.trajectory_world if p is not None]
+        if len(valid_points) < 3:
+            return None
+
+        # Analisa os últimos 3 pontos calculados em coordenadas reais de campo (x, y)
+        p1, p2, p3 = valid_points[0], valid_points[1], valid_points[2]
+
+        # Variação do movimento no sentido longitudinal da quadra (Eixo Y)
+        dy1 = p2[1] - p1[1]
+        dy2 = p3[1] - p2[1]
+
+        # Inversão do vetor de movimento indica um toque no solo / alteração parabólica
+        if dy1 * dy2 < 0:
+            bounce_point = p2
+
+            # Evita registar múltiplos ressaltos no mesmo local num curto intervalo
+            if self.bounces:
+                last_b_pos, _ = self.bounces[-1]
+                dist = np.hypot(
+                    bounce_point[0] - last_b_pos[0],
+                    bounce_point[1] - last_b_pos[1],
+                )
+                if dist < 0.8:  # Menos de 80 cm de diferença -> ignorar duplicado
+                    return None
+
+            # Valida se está dentro do retângulo oficial do modelo de quadra (com margem de linha)
+            is_in = (
+                0.0 <= bounce_point[0] <= court_model.width
+                and 0.0 <= bounce_point[1] <= court_model.length
+            )
+
+            bounce_info = (bounce_point, is_in)
+            self.bounces.append(bounce_info)
+            return bounce_info
+
+        return None
+
     def _create_player_mask(self, frame_shape, player_boxes):
-        """Cria uma máscara que remove as regiões dos jogadores."""
+        """Cria uma máscara rigorosa que remove os jogadores e a sua vestimenta."""
         height, width = frame_shape[:2]
         player_mask = np.full((height, width), 255, dtype=np.uint8)
 
@@ -85,9 +133,9 @@ class BallDetector:
         for box in player_boxes:
             try:
                 x1, y1, x2, y2 = map(int, box[:4])
-                pad_x = 15
-                pad_top = 10
-                pad_bottom = 20
+                pad_x = 25
+                pad_top = 25
+                pad_bottom = 25
 
                 x1 = max(0, x1 - pad_x)
                 y1 = max(0, y1 - pad_top)
@@ -101,16 +149,12 @@ class BallDetector:
         return player_mask
 
     def _create_yellow_mask(self, frame):
-        #Procura a faixa amarela/esverdeada brilhante da bola, ignorando folhagens
-        
+        """Procura a faixa amarela/esverdeada da bola, aceitando zonas de sombra."""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        
-        # Exige mais Saturação (mínimo 60 em vez de 40) para ignorar árvores e sombras
-        lower_yellow = np.array([25, 60, 90], dtype=np.uint8)
+        lower_yellow = np.array([20, 45, 50], dtype=np.uint8)
         upper_yellow = np.array([55, 255, 255], dtype=np.uint8)
 
         yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
-
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         yellow_mask = cv2.dilate(yellow_mask, kernel, iterations=1)
 
@@ -126,7 +170,6 @@ class BallDetector:
         self.previous_gray = gray.copy()
 
         _, motion_mask = cv2.threshold(difference, 10, 255, cv2.THRESH_BINARY)
-
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         motion_mask = cv2.dilate(motion_mask, kernel, iterations=1)
 
@@ -141,18 +184,17 @@ class BallDetector:
             return search_mask
 
         predicted_x, predicted_y = predicted_point
-
         if not (0 <= predicted_x < width and 0 <= predicted_y < height):
             return search_mask
 
-        radius = min(300, 100 + (self.missed_frames * 30))
+        radius = min(350, 120 + (self.missed_frames * 35))
         search_mask[:] = 0
         cv2.circle(search_mask, predicted_point, radius, 255, -1)
 
         return search_mask
 
     def _is_inside_court(self, center, homography, court_model):
-        """Verifica se o candidato está dentro dos limites da quadra."""
+        """Verifica se o candidato está dentro dos limites alargados da quadra."""
         if homography is None or court_model is None:
             return True, None
 
@@ -175,7 +217,7 @@ class BallDetector:
         """Verifica se o ponto está na lista de bloqueio de ruídos estáticos."""
         for blocked_pt in self.blocked_static_points:
             dist = np.hypot(center[0] - blocked_pt[0], center[1] - blocked_pt[1])
-            if dist < 25.0:  # Raio de bloqueio ao redor da linha/ruído
+            if dist < 25.0:
                 return True
         return False
 
@@ -192,7 +234,6 @@ class BallDetector:
         """Calcula a pontuação do candidato."""
         score = 0.0
 
-        # --- Geometria ---
         ideal_radius = 3.5
         radius_difference = abs(radius - ideal_radius)
         score += max(0.0, 25.0 - (radius_difference * 4.0))
@@ -203,19 +244,16 @@ class BallDetector:
 
         score += min(15.0, circularity * 20.0)
 
-        # --- Cor Amarela (Obrigatória) ---
         if yellow_value > 0:
             score += 30.0
         else:
-            score -= 40.0  # Desqualifica se não tiver tom amarelo
+            score -= 40.0
 
-        # --- MOVIMENTO REAL ---
         if motion_value > 0:
             score += 40.0
         else:
-            score -= 50.0  # Desqualifica se estiver parado (como as linhas da quadra)
+            score -= 50.0
 
-        # --- Distância do Kalman ---
         if predicted_point is not None:
             distance = float(
                 np.hypot(
@@ -234,7 +272,6 @@ class BallDetector:
         self.frame_number += 1
         height, width = frame.shape[:2]
 
-        # Limpa periodicamente a lista de pontos bloqueados antigos
         if self.frame_number % 120 == 0:
             self.blocked_static_points.clear()
 
@@ -256,28 +293,24 @@ class BallDetector:
         yellow_mask = self._create_yellow_mask(frame)
         motion_mask = self._create_motion_mask(gray)
 
-        # --- MÁSCARA DE REGIÃO DE INTERESSE (ROI) ---
-        # Corta o topo (árvores + lona/bancadas do fundo) a partir de ~30% da altura
         roi_mask = np.zeros((height, width), dtype=np.uint8)
-        min_y_roi = int(height * 0.30)  # <--- Ajustado de 0.18 para 0.30
+        min_y_roi = int(height * 0.28)
         roi_mask[min_y_roi:, :] = 255
 
         player_mask = self._create_player_mask(frame.shape, player_boxes)
         search_mask = self._create_search_mask(frame.shape, predicted_point)
 
-        # 4. Combinação Inteligente
-        # Se o Kalman já está a rastrear a bola, usamos a janela de busca (search_mask).
-        # Se NÃO está a rastrear, exigimos movimento (motion_mask) para não pegar placas/lonas fixas!
+        # 4. Combinação Adaptativa
         if self.kalman_initialized:
-            combined_mask = cv2.bitwise_and(yellow_mask, search_mask)
+            yellow_or_motion = cv2.bitwise_or(yellow_mask, motion_mask)
+            combined_mask = cv2.bitwise_and(yellow_or_motion, search_mask)
         else:
-            # Exige que a cor amarela esteja em movimento para iniciar o rastreio
-            yellow_in_motion = cv2.bitwise_and(yellow_mask, motion_mask)
-            combined_mask = cv2.bitwise_and(yellow_mask, yellow_in_motion)
+            combined_mask = cv2.bitwise_and(yellow_mask, motion_mask)
 
         combined_mask = cv2.bitwise_and(combined_mask, player_mask)
         combined_mask = cv2.bitwise_and(combined_mask, roi_mask)
-        # 5. Contornos
+
+        # 5. Encontrar e Filtrar Contornos
         contours, _ = cv2.findContours(
             combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -285,11 +318,17 @@ class BallDetector:
         candidates = []
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 0.5 or area > 200.0:
+            if area < 1.0 or area > 75.0:
                 continue
 
             (x, y), radius = cv2.minEnclosingCircle(contour)
-            if radius < 0.7 or radius > 10.0:
+            if radius < 0.8 or radius > 8.0:
+                continue
+
+            # Filtro de Aspect Ratio (descarta placas/lonas retangulares)
+            x_bound, y_bound, w_bound, h_bound = cv2.boundingRect(contour)
+            aspect_ratio = float(w_bound) / float(h_bound)
+            if aspect_ratio < 0.4 or aspect_ratio > 2.5:
                 continue
 
             perimeter = cv2.arcLength(contour, True)
@@ -297,12 +336,11 @@ class BallDetector:
                 continue
 
             circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-            if circularity < 0.05:
+            if circularity < 0.20:
                 continue
 
             center = (int(x), int(y))
 
-            # Ignora pontos bloqueados na Blacklist (ex: pedaço de linha estático)
             if self._is_point_blacklisted(center):
                 continue
 
@@ -350,7 +388,6 @@ class BallDetector:
             for candidate in candidates:
                 cand_center = candidate["center"]
 
-                # Validação de deslocamento (Anti-Jump)
                 if (
                     self.last_confirmed_center is not None
                     and self.missed_frames < 3
@@ -360,11 +397,10 @@ class BallDetector:
                         cand_center[1] - self.last_confirmed_center[1],
                     )
 
-                    max_allowed_jump = 55.0
+                    max_allowed_jump = 65.0
                     if dist_from_last > max_allowed_jump:
                         continue
 
-                # Para iniciar o rastreio do zero, EXIGE movimento real!
                 if not self.kalman_initialized and candidate["motion_value"] == 0:
                     continue
 
@@ -373,7 +409,7 @@ class BallDetector:
                     world_pos = candidate["world_pos"]
                     break
 
-        # 7. Atualiza Kalman e verifica se está congelado na linha
+        # 7. Atualiza Kalman
         if ball_center is not None:
             if self.last_confirmed_center is not None:
                 dist_stuck = np.hypot(
@@ -385,7 +421,6 @@ class BallDetector:
                 else:
                     self.static_frames_count = 0
 
-            # Se ficou preso no mesmo local por mais de 3 frames: BLOQUEIA o ponto e RESETA!
             if self.static_frames_count >= 3:
                 self.blocked_static_points.append(ball_center)
                 self.reset_kalman()
@@ -421,6 +456,10 @@ class BallDetector:
 
             self.trajectory_pixels.appendleft(ball_center)
             self.trajectory_world.appendleft(world_pos)
+
+            # Executa a verificação de ressalto (Bounce) se houver modelo de campo disponível
+            if court_model is not None:
+                self.check_bounce(court_model)
         else:
             self.static_frames_count = 0
             self.missed_frames += 1
@@ -446,18 +485,7 @@ class BallDetector:
                     (0, 255, 255),
                     1,
                 )
-                cv2.putText(
-                    debug_candidates,
-                    f'{candidate["score"]:.0f}',
-                    (cnt_center[0] + 5, cnt_center[1] - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4,
-                    (0, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
 
-            # Desenha os pontos bloqueados (linhas estáticas ignoradas)
             for pt in self.blocked_static_points:
                 cv2.circle(debug_candidates, pt, 12, (0, 0, 0), 2)
 
@@ -477,7 +505,7 @@ class BallDetector:
         return ball_center, world_pos
 
     def draw_ball_trail(self, frame):
-        """Desenha a trajetória apenas entre pontos válidos."""
+        """Desenha a trajetória no vídeo original."""
         for index in range(1, len(self.trajectory_pixels)):
             point_1 = self.trajectory_pixels[index - 1]
             point_2 = self.trajectory_pixels[index]
