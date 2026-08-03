@@ -95,9 +95,12 @@ class VideoProcessor:
             # Extrai as Bounding Boxes dos jogadores com segurança
             player_boxes = [p["bbox"] for p in players if "bbox" in p]
 
-            # 2. Detecta e Rastreia a Bola (ignorando ROI dos jogadores + filtro físico)
+            # 2. Detecta e Rastreia a Bola (ignorando ROI dos jogadores)
             ball_center, ball_world = ball_detector.detect(
-                frame, homography, court_model, player_boxes=player_boxes
+                frame,
+                homography=homography,
+                court_model=court_model,
+                player_boxes=player_boxes,
             )
 
             # 3. Desenha a quadra 2D (Bird's-Eye View) + HUD + Jogadores + Bola

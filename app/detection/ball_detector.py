@@ -4,15 +4,6 @@ import numpy as np
 
 
 class BallDetector:
-    """
-    Detector de bola de ténis robusto com:
-    1. Filtro HSV para bola amarela (tolerante a sombras).
-    2. Motion Mask (diferença de frames).
-    3. Blacklist de pontos estáticos (elimina linhas brancas e ruídos).
-    4. Restrições geométricas (Aspect Ratio e Circularidade).
-    5. Deteção de Bounce (Ressalto no solo IN/OUT).
-    6. Rastreio e suavização via Filtro de Kalman.
-    """
 
     def __init__(self, max_buffer=30):
         self.max_buffer = max_buffer
@@ -30,44 +21,29 @@ class BallDetector:
         self.frame_number = 0
         self.show_debug = True
 
-        # Posições bloqueadas por serem estáticas (linhas, brilhos fixos, etc.)
         self.blocked_static_points = []
-
-        # Histórico de ressaltos para a vista 2D: [(world_pos, is_in), ...]
         self.bounces = []
 
         # ---------------------------------------------------------
-        # Filtro de Kalman
+        # Filtro de Kalman (4 estados: x, y, vx, vy | 2 medições: x, y)
         # ---------------------------------------------------------
         self.kalman = cv2.KalmanFilter(4, 2)
-
         self.kalman.measurementMatrix = np.array(
             [[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32
         )
-
         self.kalman.transitionMatrix = np.array(
             [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
             dtype=np.float32,
         )
 
-        # Ajuste de ruído do processo para acompanhar acelerações bruscas no impacto
         self.kalman.processNoiseCov = (
             np.array(
-                [
-                    [1, 0, 0, 0],
-                    [0, 1, 0, 0],
-                    [0, 0, 8, 0],
-                    [0, 0, 0, 8],
-                ],
+                [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 8, 0], [0, 0, 0, 8]],
                 dtype=np.float32,
             )
             * 0.05
         )
-
-        self.kalman.measurementNoiseCov = (
-            np.eye(2, dtype=np.float32) * 4.0
-        )
-
+        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 4.0
         self.kalman.errorCovPost = np.eye(4, dtype=np.float32) * 20.0
 
     def reset_kalman(self):
@@ -81,36 +57,36 @@ class BallDetector:
         self.kalman.statePost = np.zeros((4, 1), dtype=np.float32)
 
     def check_bounce(self, court_model):
-        """
-        Analisa o histórico recente de posições (trajectory_world) para identificar
-        uma mudança na trajetória (ressalto no solo) e determina se foi IN ou OUT.
-        """
+        """Analisa a variação de vetor para detetar ressaltos reais com menor taxa de falso positivo."""
         valid_points = [p for p in self.trajectory_world if p is not None]
-        if len(valid_points) < 3:
+        if len(valid_points) < 4:
             return None
 
-        # Analisa os últimos 3 pontos calculados em coordenadas reais de campo (x, y)
-        p1, p2, p3 = valid_points[0], valid_points[1], valid_points[2]
+        p1, p2, p3, p4 = (
+            valid_points[0],
+            valid_points[1],
+            valid_points[2],
+            valid_points[3],
+        )
 
-        # Variação do movimento no sentido longitudinal da quadra (Eixo Y)
+        # Variação temporal
         dy1 = p2[1] - p1[1]
         dy2 = p3[1] - p2[1]
+        dy3 = p4[1] - p3[1]
 
-        # Inversão do vetor de movimento indica um toque no solo / alteração parabólica
-        if dy1 * dy2 < 0:
+        # Inversão nítida de sentido no eixo longitudinal
+        if (dy1 * dy2 < 0) or (dy2 * dy3 < 0):
             bounce_point = p2
 
-            # Evita registar múltiplos ressaltos no mesmo local num curto intervalo
             if self.bounces:
                 last_b_pos, _ = self.bounces[-1]
                 dist = np.hypot(
                     bounce_point[0] - last_b_pos[0],
                     bounce_point[1] - last_b_pos[1],
                 )
-                if dist < 0.8:  # Menos de 80 cm de diferença -> ignorar duplicado
+                if dist < 1.0:  # Evita duplicados a menos de 1 metro
                     return None
 
-            # Valida se está dentro do retângulo oficial do modelo de quadra (com margem de linha)
             is_in = (
                 0.0 <= bounce_point[0] <= court_model.width
                 and 0.0 <= bounce_point[1] <= court_model.length
@@ -123,7 +99,7 @@ class BallDetector:
         return None
 
     def _create_player_mask(self, frame_shape, player_boxes):
-        """Cria uma máscara rigorosa que remove os jogadores e a sua vestimenta."""
+        """Oculta o jogador E a sua sombra projetada no chão (diagonal inferior esquerda)."""
         height, width = frame_shape[:2]
         player_mask = np.full((height, width), 255, dtype=np.uint8)
 
@@ -132,27 +108,39 @@ class BallDetector:
 
         for box in player_boxes:
             try:
-                x1, y1, x2, y2 = map(int, box[:4])
-                pad_x = 25
-                pad_top = 25
-                pad_bottom = 25
+                if hasattr(box, "xyxy"):
+                    coords = box.xyxy[0].cpu().numpy()
+                elif isinstance(box, (list, tuple, np.ndarray)):
+                    coords = box[:4]
+                else:
+                    continue
 
-                x1 = max(0, x1 - pad_x)
-                y1 = max(0, y1 - pad_top)
-                x2 = min(width, x2 + pad_x)
-                y2 = min(height, y2 + pad_bottom)
+                x1, y1, x2, y2 = map(int, coords)
 
-                player_mask[y1:y2, x1:x2] = 0
-            except (TypeError, ValueError, IndexError):
+                # O sol projeta a sombra para a ESQUERDA e para BAIXO
+                pad_x_left = 120  # Expande bastante para a esquerda (zona da sombra)
+                pad_x_right = 40
+                pad_top = 40
+                pad_bottom = 60
+
+                px1 = max(0, x1 - pad_x_left)
+                py1 = max(0, y1 - pad_top)
+                px2 = min(width, x2 + pad_x_right)
+                py2 = min(height, y2 + pad_bottom)
+
+                # Pinta a área do jogador + sombra a PRETO (0) para ignorar
+                player_mask[py1:py2, px1:px2] = 0
+            except Exception:
                 continue
 
         return player_mask
 
     def _create_yellow_mask(self, frame):
-        """Procura a faixa amarela/esverdeada da bola, aceitando zonas de sombra."""
+        """Mascara HSV para capturar a bola amarela."""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower_yellow = np.array([20, 45, 50], dtype=np.uint8)
-        upper_yellow = np.array([55, 255, 255], dtype=np.uint8)
+
+        lower_yellow = np.array([14, 30, 40], dtype=np.uint8)
+        upper_yellow = np.array([65, 255, 255], dtype=np.uint8)
 
         yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -161,22 +149,30 @@ class BallDetector:
         return yellow_mask
 
     def _create_motion_mask(self, gray):
-        """Cria uma máscara pela diferença de movimento entre frames."""
+        """Máscara de movimento filtrando sombras escuras do chão."""
         if self.previous_gray is None:
             self.previous_gray = gray.copy()
             return np.zeros_like(gray, dtype=np.uint8)
 
         difference = cv2.absdiff(gray, self.previous_gray)
-        self.previous_gray = gray.copy()
 
-        _, motion_mask = cv2.threshold(difference, 10, 255, cv2.THRESH_BINARY)
+        # Threshold de movimento
+        _, motion_mask = cv2.threshold(difference, 12, 255, cv2.THRESH_BINARY)
+
+        # FILTRO DE SOMBRAS:
+        # Pixels muito escuros (< 70) são sombras no chão -> elimina!
+        _, bright_mask = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY)
+        motion_mask = cv2.bitwise_and(motion_mask, bright_mask)
+
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
         motion_mask = cv2.dilate(motion_mask, kernel, iterations=1)
 
+        self.previous_gray = gray.copy()
         return motion_mask
 
     def _create_search_mask(self, image_shape, predicted_point):
-        """Cria a janela de busca baseada no Kalman."""
+        """Cria uma região circular contida em redor da previsão do Kalman."""
         height, width = image_shape[:2]
         search_mask = np.full((height, width), 255, dtype=np.uint8)
 
@@ -187,14 +183,14 @@ class BallDetector:
         if not (0 <= predicted_x < width and 0 <= predicted_y < height):
             return search_mask
 
-        radius = min(350, 120 + (self.missed_frames * 35))
+        # Limitado a no máximo 120px para não apanhar metade da imagem quando a bola falha
+        radius = min(120, 60 + (self.missed_frames * 10))
         search_mask[:] = 0
         cv2.circle(search_mask, predicted_point, radius, 255, -1)
 
         return search_mask
 
     def _is_inside_court(self, center, homography, court_model):
-        """Verifica se o candidato está dentro dos limites alargados da quadra."""
         if homography is None or court_model is None:
             return True, None
 
@@ -214,7 +210,6 @@ class BallDetector:
         return inside, (world_x, world_y)
 
     def _is_point_blacklisted(self, center):
-        """Verifica se o ponto está na lista de bloqueio de ruídos estáticos."""
         for blocked_pt in self.blocked_static_points:
             dist = np.hypot(center[0] - blocked_pt[0], center[1] - blocked_pt[1])
             if dist < 25.0:
@@ -231,7 +226,6 @@ class BallDetector:
         yellow_value,
         motion_value,
     ):
-        """Calcula a pontuação do candidato."""
         score = 0.0
 
         ideal_radius = 3.5
@@ -247,12 +241,12 @@ class BallDetector:
         if yellow_value > 0:
             score += 30.0
         else:
-            score -= 40.0
+            score -= 30.0
 
         if motion_value > 0:
             score += 40.0
         else:
-            score -= 50.0
+            score -= 40.0
 
         if predicted_point is not None:
             distance = float(
@@ -261,14 +255,13 @@ class BallDetector:
                     center[1] - predicted_point[1],
                 )
             )
-            score += max(0.0, 30.0 - (distance * 0.15))
+            score += max(0.0, 35.0 - (distance * 0.2))
 
         return score
 
     def detect(
         self, frame, homography=None, court_model=None, player_boxes=None
     ):
-        """Deteta a bola no frame atual."""
         self.frame_number += 1
         height, width = frame.shape[:2]
 
@@ -285,32 +278,34 @@ class BallDetector:
             if 0 <= predicted_x < width and 0 <= predicted_y < height:
                 predicted_point = (predicted_x, predicted_y)
 
-        # 2. Cinza
+        # 2. Imagem em tons de cinza
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-        # 3. Máscaras
+        # 3. Gerar Máscaras
         yellow_mask = self._create_yellow_mask(frame)
         motion_mask = self._create_motion_mask(gray)
 
+        # ROI MAIS RESTRITA: corta o topo da imagem (árvores/fundo)
         roi_mask = np.zeros((height, width), dtype=np.uint8)
-        min_y_roi = int(height * 0.28)
+        min_y_roi = int(height * 0.35)  # Corta o fundo ruidoso acima da rede
         roi_mask[min_y_roi:, :] = 255
 
         player_mask = self._create_player_mask(frame.shape, player_boxes)
         search_mask = self._create_search_mask(frame.shape, predicted_point)
 
-        # 4. Combinação Adaptativa
+        # 4. Combinação de Máscaras
         if self.kalman_initialized:
             yellow_or_motion = cv2.bitwise_or(yellow_mask, motion_mask)
             combined_mask = cv2.bitwise_and(yellow_or_motion, search_mask)
         else:
+            # EXIGIR AMARELO E MOVIMENTO no início evita apanhar árvores/fundo solto
             combined_mask = cv2.bitwise_and(yellow_mask, motion_mask)
 
         combined_mask = cv2.bitwise_and(combined_mask, player_mask)
         combined_mask = cv2.bitwise_and(combined_mask, roi_mask)
 
-        # 5. Encontrar e Filtrar Contornos
+        # 5. Filtrar Contornos
         contours, _ = cv2.findContours(
             combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -318,17 +313,16 @@ class BallDetector:
         candidates = []
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 1.0 or area > 75.0:
+            if area < 1.0 or area > 120.0:  # Descarta manchas grandes do fundo
                 continue
 
             (x, y), radius = cv2.minEnclosingCircle(contour)
-            if radius < 0.8 or radius > 8.0:
+            if radius < 0.5 or radius > 12.0:
                 continue
 
-            # Filtro de Aspect Ratio (descarta placas/lonas retangulares)
             x_bound, y_bound, w_bound, h_bound = cv2.boundingRect(contour)
             aspect_ratio = float(w_bound) / float(h_bound)
-            if aspect_ratio < 0.4 or aspect_ratio > 2.5:
+            if aspect_ratio < 0.25 or aspect_ratio > 3.5:
                 continue
 
             perimeter = cv2.arcLength(contour, True)
@@ -336,10 +330,32 @@ class BallDetector:
                 continue
 
             circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-            if circularity < 0.20:
+            if circularity < 0.12:
                 continue
 
             center = (int(x), int(y))
+
+            # --- SEGUNDA BARREIRA CONTRA O JOGADOR ---
+            is_player_noise = False
+            if player_boxes:
+                for box in player_boxes:
+                    try:
+                        bx1, by1, bx2, by2 = map(
+                            int,
+                            box[:4]
+                            if isinstance(box, (list, tuple, np.ndarray))
+                            else box.xyxy[0],
+                        )
+                        if (bx1 - 80) <= center[0] <= (bx2 + 30) and (
+                            by1 - 30
+                        ) <= center[1] <= (by2 + 50):
+                            is_player_noise = True
+                            break
+                    except Exception:
+                        pass
+            if is_player_noise:
+                continue
+            # -----------------------------------------
 
             if self._is_point_blacklisted(center):
                 continue
@@ -378,7 +394,7 @@ class BallDetector:
                 }
             )
 
-        # 6. Seleciona o melhor candidato
+        # 6. Escolher o melhor candidato
         ball_center = None
         world_pos = None
 
@@ -396,20 +412,15 @@ class BallDetector:
                         cand_center[0] - self.last_confirmed_center[0],
                         cand_center[1] - self.last_confirmed_center[1],
                     )
-
-                    max_allowed_jump = 65.0
-                    if dist_from_last > max_allowed_jump:
+                    if dist_from_last > 100.0:
                         continue
 
-                if not self.kalman_initialized and candidate["motion_value"] == 0:
-                    continue
-
-                if candidate["score"] >= 25.0:
+                if candidate["score"] >= 12.0:
                     ball_center = cand_center
                     world_pos = candidate["world_pos"]
                     break
 
-        # 7. Atualiza Kalman
+        # 7. Atualização do Filtro de Kalman
         if ball_center is not None:
             if self.last_confirmed_center is not None:
                 dist_stuck = np.hypot(
@@ -429,10 +440,7 @@ class BallDetector:
                 return None, None
 
             measurement = np.array(
-                [
-                    [np.float32(ball_center[0])],
-                    [np.float32(ball_center[1])],
-                ],
+                [[np.float32(ball_center[0])], [np.float32(ball_center[1])]],
                 dtype=np.float32,
             )
 
@@ -457,7 +465,6 @@ class BallDetector:
             self.trajectory_pixels.appendleft(ball_center)
             self.trajectory_world.appendleft(world_pos)
 
-            # Executa a verificação de ressalto (Bounce) se houver modelo de campo disponível
             if court_model is not None:
                 self.check_bounce(court_model)
         else:
@@ -471,7 +478,7 @@ class BallDetector:
                 self.trajectory_pixels.clear()
                 self.trajectory_world.clear()
 
-        # 8. Visualização Debug
+        # 8. Janelas de Debug
         if self.show_debug:
             debug_candidates = frame.copy()
 
@@ -505,7 +512,7 @@ class BallDetector:
         return ball_center, world_pos
 
     def draw_ball_trail(self, frame):
-        """Desenha a trajetória no vídeo original."""
+        """Desenha a linha amarela de trajetória e o marcador da bola."""
         for index in range(1, len(self.trajectory_pixels)):
             point_1 = self.trajectory_pixels[index - 1]
             point_2 = self.trajectory_pixels[index]
