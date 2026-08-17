@@ -1,11 +1,5 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-videos/*.mp4
+*.pt
+*.onnx
+download_tracknet.py
+generate_tracknet_model.py
+convert_real_tracknet.py
