@@ -10,6 +10,7 @@ class BallDetector:
 
         self.trajectory_pixels = collections.deque(maxlen=max_buffer)
         self.trajectory_world = collections.deque(maxlen=max_buffer)
+        self.confirmed_positions_history = collections.deque(maxlen=6)
 
         self.previous_gray = None
         self.prev_gray_2 = None
@@ -21,6 +22,7 @@ class BallDetector:
         self.last_confirmed_center = None
         self.frame_number = 0
         self.show_debug = True
+        self.verbose_logging = True
 
         self.blocked_static_points = []
         self.bounces = []
@@ -53,6 +55,7 @@ class BallDetector:
         self.missed_frames = 0
         self.static_frames_count = 0
         self.last_confirmed_center = None
+        self.confirmed_positions_history.clear()
 
         self.kalman.statePre = np.zeros((4, 1), dtype=np.float32)
         self.kalman.statePost = np.zeros((4, 1), dtype=np.float32)
@@ -128,11 +131,23 @@ class BallDetector:
         return player_mask
 
     def _create_yellow_mask(self, frame):
-        """Mascara HSV com tolerância alargada para capturar amarelo em movimento."""
+        """Mascara HSV calibrada com pixels reais da bola do vídeo
+        tennis_2.mp4 (medidos com tests/inspect_ball_color.py):
+        H entre 15-22, S entre 106-138, V entre 140-188 sob luz solar
+        direta.
+
+        O brilho (V) é o canal mais discriminante: ao medir pontos do
+        fundo (prédio, ramos secos, terra) que caem na mesma faixa de
+        matiz/saturação da bola, o maior valor de V encontrado entre
+        eles foi 72 - bem abaixo do menor V medido na bola (140). Por
+        isso o limite inferior de V foi definido em 130: mantém uma
+        margem de segurança confortável dos dois lados, sem exigir
+        exatamente o valor mínimo medido na bola.
+        """
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        lower_yellow = np.array([12, 20, 30], dtype=np.uint8)
-        upper_yellow = np.array([75, 255, 255], dtype=np.uint8)
+        lower_yellow = np.array([10, 80, 130], dtype=np.uint8)
+        upper_yellow = np.array([30, 255, 255], dtype=np.uint8)
 
         yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -181,24 +196,43 @@ class BallDetector:
         return search_mask
 
     def _is_inside_court(self, center, homography, court_model):
-            if homography is None or court_model is None:
-                return True, None
+        if homography is None or court_model is None:
+            return True, None
 
-            try:
-                world_x, world_y = homography.transform_point_to_world(center)
-            except Exception:
-                return False, None
+        try:
+            world_x, world_y = homography.transform_point_to_world(center)
+        except Exception:
+            return False, None
 
-            # Expande as margens longitudinais (Y) para não rejeitar a bola quando voa alta
-            margin_x = 2.5
-            margin_y = 5.0  # Alargado para absorver o erro de paralaxe da altura da bola
+        # Pontos cujo pixel está ACIMA da linha mais alta calibrada (ou seja,
+        # acima de todos os 4 cantos usados na calibração) representam,
+        # necessariamente, algo no ar acima da quadra - não existe chão ali
+        # para a homografia interpretar. Nessa faixa, a homografia plana
+        # extrapola e pode devolver coordenadas de mundo muito distantes
+        # mesmo que a bola esteja, na realidade, sobre a quadra.
+        # Por isso não aplicamos o filtro geométrico aqui: confiamos nos
+        # outros filtros (cor, movimento, continuidade do Kalman) para
+        # decidir se o candidato é válido.
+        calibrated_min_y = min(
+            homography.image_points.top_left[1],
+            homography.image_points.top_right[1],
+            homography.image_points.bottom_right[1],
+            homography.image_points.bottom_left[1],
+        )
 
-            inside = (
-                -margin_x <= world_x <= (court_model.width + margin_x)
-                and -margin_y <= world_y <= (court_model.length + margin_y)
-            )
+        if center[1] < calibrated_min_y:
+            return True, (world_x, world_y)
 
-            return inside, (world_x, world_y)
+        # Expande as margens longitudinais (Y) para não rejeitar a bola quando voa alta
+        margin_x = 2.5
+        margin_y = 5.0  # Alargado para absorver o erro de paralaxe da altura da bola
+
+        inside = (
+            -margin_x <= world_x <= (court_model.width + margin_x)
+            and -margin_y <= world_y <= (court_model.length + margin_y)
+        )
+
+        return inside, (world_x, world_y)
 
     def _is_point_blacklisted(self, center):
         for blocked_pt in self.blocked_static_points:
@@ -232,9 +266,13 @@ class BallDetector:
 
         if yellow_value > 0:
             score += 20.0
-        elif is_far_field:
-            # Recompensa candidatos distantes mesmo sem sinal de cor amarela
-            score += 15.0
+            # O bônus de campo distante só se aplica quando também há
+            # sinal de cor - sem isso, ruído de fundo (folhas, sombras)
+            # em campo distante ganhava pontos apenas por estar longe,
+            # o que causava falsos positivos sem nenhuma relação com a
+            # cor real da bola.
+            if is_far_field:
+                score += 15.0
 
         if predicted_point is not None:
             distance = float(
@@ -246,6 +284,38 @@ class BallDetector:
             score += max(0.0, 40.0 - (distance * 0.25))
 
         return score
+
+    def _is_trajectory_erratic(self, candidate_center):
+        """Verifica se aceitar candidate_center resultaria numa trajetória
+        errática (ziguezague), típica de ruído de vegetação balançando,
+        em vez de um voo real de bola de tênis.
+
+        Compara o deslocamento líquido (ponto inicial -> ponto final da
+        janela recente) com a distância total percorrida passo a passo.
+        Uma bola em voo real tem eficiência alta (~0.6-1.0): ela vai
+        consistentemente para algum lugar. Ruído oscilante (folhas ao
+        vento) tem eficiência baixa: percorre bastante distância total
+        sem se afastar muito do ponto de partida.
+        """
+        if len(self.confirmed_positions_history) < 4:
+            return False
+
+        points = list(self.confirmed_positions_history) + [candidate_center]
+
+        total_path_length = sum(
+            np.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1])
+            for i in range(1, len(points))
+        )
+
+        if total_path_length < 1e-6:
+            return False
+
+        net_displacement = np.hypot(
+            points[-1][0] - points[0][0], points[-1][1] - points[0][1]
+        )
+
+        efficiency = net_displacement / total_path_length
+        return efficiency < 0.3
 
     def detect(
         self, frame, homography=None, court_model=None, player_boxes=None
@@ -274,16 +344,37 @@ class BallDetector:
         yellow_mask = self._create_yellow_mask(frame)
         motion_mask = self._create_motion_mask(gray)
 
-        # ROI de contexto
+        # ROI de contexto: quando temos a homografia, calculamos o corte a
+        # partir da linha mais alta calibrada, com folga extra para cima
+        # (permite bolas voando acima do ponto mais distante calibrado,
+        # normal em saques). Sem homografia, usamos o valor fixo antigo
+        # como fallback.
+        if homography is not None:
+            calibrated_min_y = min(
+                homography.image_points.top_left[1],
+                homography.image_points.top_right[1],
+                homography.image_points.bottom_right[1],
+                homography.image_points.bottom_left[1],
+            )
+            roi_top = max(0, int(calibrated_min_y - height * 0.6))
+        else:
+            roi_top = int(height * 0.25)
+
         roi_mask = np.zeros((height, width), dtype=np.uint8)
-        min_y_roi = int(height * 0.25)
-        roi_mask[min_y_roi:, :] = 255
+        roi_mask[roi_top:, :] = 255
 
         player_mask = self._create_player_mask(frame.shape, player_boxes)
         search_mask = self._create_search_mask(frame.shape, predicted_point)
 
-        # 4. Combinação de Máscaras (Privilegia o movimento)
-        combined_mask = cv2.bitwise_and(motion_mask, player_mask)
+        # 4. Combinação de Máscaras
+        # A bola pode estar momentaneamente quase parada (ápice do toss
+        # no saque), quando o motion_mask não gera sinal suficiente.
+        # Por isso um candidato pode entrar por movimento OU por cor
+        # amarela forte - a cor sozinha também qualifica um contorno
+        # para ser avaliado, mas o score final (_score_candidate)
+        # ainda decide se ele é aceito.
+        motion_or_color_mask = cv2.bitwise_or(motion_mask, yellow_mask)
+        combined_mask = cv2.bitwise_and(motion_or_color_mask, player_mask)
         combined_mask = cv2.bitwise_and(combined_mask, roi_mask)
 
         if self.kalman_initialized:
@@ -359,6 +450,40 @@ class BallDetector:
             yellow_val = int(yellow_mask[center_y, center_x])
             motion_val = int(motion_mask[center_y, center_x])
 
+            if motion_val == 0 and yellow_val > 0:
+                # is_far_field (y < 55% da altura) é muito permissivo para
+                # este filtro - ele inclui toda a altura da rede, que é
+                # exatamente onde vimos elementos fixos (ilhós, parafusos)
+                # sendo confundidos com a bola. Um toss de saque parado só
+                # é plausível bem acima da linha mais alta calibrada, não
+                # em qualquer ponto da metade superior do frame.
+                if homography is not None:
+                    calibrated_min_y = min(
+                        homography.image_points.top_left[1],
+                        homography.image_points.top_right[1],
+                        homography.image_points.bottom_right[1],
+                        homography.image_points.bottom_left[1],
+                    )
+                    high_altitude_threshold = calibrated_min_y - height * 0.25
+                else:
+                    high_altitude_threshold = height * 0.15
+
+                if center[1] > high_altitude_threshold:
+                    continue
+                if circularity < 0.55 or radius > 6.0:
+                    continue
+
+            # Um candidato que só tem sinal de cor, sem nenhum movimento,
+            # é o caso mais explorado por elementos estáticos e amarelados
+            # do fundo (faixas de propaganda, fita da rede sob luz forte).
+            # Para esse caso específico, exigimos geometria muito mais
+            # estrita - quase um círculo perfeito e raio pequeno - já que
+            # a bola raramente fica perfeitamente parada por vários frames.
+            if motion_val == 0 and yellow_val > 0:
+                if circularity < 0.55 or radius > 6.0:
+                    continue
+
+
             score = self._score_candidate(
                 center,
                 radius,
@@ -381,7 +506,7 @@ class BallDetector:
                 }
             )
 
-        # 6. Escolher o melhor candidato
+        # 6. Escolher o melhor candidato (agora também exige trajetória plausível)
         ball_center = None
         world_pos = None
 
@@ -402,11 +527,42 @@ class BallDetector:
                     if dist_from_last > 140.0:
                         continue
 
-                # Aceita candidatos com pontuação mínima a partir de 3.0
+                # Aceita candidatos com pontuação mínima a partir de 3.0,
+                # desde que a trajetória resultante não seja errática.
                 if candidate["score"] >= 3.0:
+                    if self._is_trajectory_erratic(cand_center):
+                        continue
                     ball_center = cand_center
                     world_pos = candidate["world_pos"]
                     break
+
+        # --- LOG DE DIAGNÓSTICO (temporário) ---
+        if self.verbose_logging:
+            top_scores = sorted(
+                (round(c["score"], 1) for c in candidates), reverse=True
+            )[:3]
+            best_candidate_info = "n/a"
+            if candidates:
+                best = max(candidates, key=lambda c: c["score"])
+                bx, by = best["center"]
+                by_clamped = min(height - 1, max(0, by))
+                bx_clamped = min(width - 1, max(0, bx))
+                best_yellow = int(yellow_mask[by_clamped, bx_clamped])
+                best_motion = int(motion_mask[by_clamped, bx_clamped])
+                best_candidate_info = (
+                    f"pos=({bx},{by}) yellow={best_yellow} motion={best_motion}"
+                )
+            print(
+                f"[frame {self.frame_number}] "
+                f"contornos_brutos={len(contours)} "
+                f"candidatos_validos={len(candidates)} "
+                f"top_scores={top_scores} "
+                f"ball_center={ball_center} "
+                f"melhor_candidato=({best_candidate_info}) "
+                f"kalman_ativo={self.kalman_initialized} "
+                f"missed_frames={self.missed_frames} "
+                f"blacklist={len(self.blocked_static_points)}"
+            )
 
         # 7. Atualização do Filtro de Kalman
         if ball_center is not None:
@@ -420,7 +576,7 @@ class BallDetector:
                 else:
                     self.static_frames_count = 0
 
-            if self.static_frames_count >= 4:
+            if self.static_frames_count >= 2:
                 self.blocked_static_points.append(ball_center)
                 self.reset_kalman()
                 self.trajectory_pixels.clear()
@@ -449,6 +605,7 @@ class BallDetector:
             self.kalman.correct(measurement)
             self.missed_frames = 0
             self.last_confirmed_center = ball_center
+            self.confirmed_positions_history.append(ball_center)
 
             self.trajectory_pixels.appendleft(ball_center)
             self.trajectory_world.appendleft(world_pos)
