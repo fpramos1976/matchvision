@@ -261,24 +261,6 @@ class BallDetector:
         self.previous_gray = gray.copy()
         return motion_mask
 
-    def _create_search_mask(self, image_shape, predicted_point):
-        """Cria uma região circular de pesquisa em redor da previsão do Kalman."""
-        height, width = image_shape[:2]
-        search_mask = np.full((height, width), 255, dtype=np.uint8)
-
-        if predicted_point is None:
-            return search_mask
-
-        predicted_x, predicted_y = predicted_point
-        if not (0 <= predicted_x < width and 0 <= predicted_y < height):
-            return search_mask
-
-        radius = min(150, 70 + (self.missed_frames * 12))
-        search_mask[:] = 0
-        cv2.circle(search_mask, predicted_point, radius, 255, -1)
-
-        return search_mask
-
     @staticmethod
     def _calibrated_min_y(homography):
         """Linha (y em pixels) mais alta entre os 4 cantos calibrados."""
@@ -486,7 +468,6 @@ class BallDetector:
         roi_mask[roi_top:, :] = 255
 
         player_mask = self._create_player_mask(frame.shape, player_boxes)
-        search_mask = self._create_search_mask(frame.shape, predicted_point)
 
         # 4. Combinação de Máscaras
         # A bola pode estar momentaneamente quase parada (ápice do toss
@@ -503,9 +484,13 @@ class BallDetector:
         # corpo, e apagar a caixa inteira fazia o tracker perder a bola
         # em todo golpe. Candidatos dentro da caixa passam por um filtro
         # mais rígido (perto da previsão + cor amarela) no loop abaixo.
-        if self.kalman_initialized and predicted_point is not None:
-            combined_mask = cv2.bitwise_and(combined_mask, search_mask)
-        else:
+        #
+        # A busca NÃO é mais restrita a um círculo em volta da previsão:
+        # quando o Kalman se prendia a um falso positivo (prédio, rede), o
+        # detector ficava cego no resto da imagem por até 20 frames e a
+        # bola real nunca era encontrada. Agora a previsão só pesa no
+        # score, e a bola pode "roubar" o tracker de volta.
+        if not (self.kalman_initialized and predicted_point is not None):
             combined_mask = cv2.bitwise_and(combined_mask, player_mask)
 
         # 5. Filtrar Contornos de Múltiplos Tamanhos
@@ -726,7 +711,9 @@ class BallDetector:
             self.trajectory_pixels.appendleft(None)
             self.trajectory_world.appendleft(None)
 
-            if self.missed_frames > 20:
+            # Perdida por ~1/4 de segundo: a previsão já não é confiável e
+            # só atrapalharia a pontuação dos novos candidatos.
+            if self.missed_frames > 8:
                 self.reset_kalman()
                 self.trajectory_pixels.clear()
                 self.trajectory_world.clear()

@@ -137,3 +137,22 @@ def test_camera_shake_does_not_track_the_net():
 
     assert correct >= 40
     assert wrong <= 3
+
+
+def test_tracker_recovers_after_locking_on_false_positive():
+    """Um falso positivo (algo amarelo se mexendo no fundo) inicializa o
+    Kalman; logo depois a bola real aparece longe dali. O detector não pode
+    ficar cego fora da região da previsão."""
+    distractor = [(100 + 3 * i, 330) for i in range(6)]
+    ball = linear_path(n=30, start=(420, 360), velocity=(-8, -6))
+    positions = distractor + ball
+    results = run(positions)
+
+    found = [
+        i
+        for i, (r, p) in enumerate(zip(results[len(distractor):], ball))
+        if r is not None and np.hypot(r[0] - p[0], r[1] - p[1]) <= 4.0
+    ]
+    assert found, "a bola real nunca foi encontrada"
+    assert found[0] <= 5
+    assert len(found) >= 0.8 * len(ball)
