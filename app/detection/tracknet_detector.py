@@ -79,7 +79,14 @@ class TrackNetBallDetector:
         max_jump=100,
         device=None,
     ):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"  # GPU dos Macs com Apple Silicon
+            else:
+                device = "cpu"
+        self.device = device
         self.model = _TrackNet()
         state = torch.load(model_path, map_location=self.device)
         self.model.load_state_dict(state)

@@ -1,3 +1,5 @@
+import os
+
 import cv2
 
 from app.calibration.manual_calibration import ManualCalibration
@@ -68,7 +70,16 @@ class VideoProcessor:
         # ==========================================
         max_players = 4 if configuration.court_type == CourtType.DOUBLES else 2
         player_detector = PlayerDetector(max_players=max_players)
-        ball_detector = BallDetector(max_buffer=25)
+        # BALL_DETECTOR=tracknet usa a rede neural (models/tracknet.pt);
+        # sem a variável, fica o detector clássico por cor/movimento.
+        if os.environ.get("BALL_DETECTOR", "").lower() == "tracknet":
+            from app.detection.tracknet_detector import TrackNetBallDetector
+
+            ball_detector = TrackNetBallDetector(fps=fps, max_buffer=25)
+            print(f"Detector de bola: TrackNet ({ball_detector.device})")
+        else:
+            ball_detector = BallDetector(max_buffer=25)
+            print("Detector de bola: clássico (cor/movimento)")
 
         # ==========================================
         # Reabre o vídeo para o Loop
