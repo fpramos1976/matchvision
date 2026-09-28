@@ -14,6 +14,7 @@ class BallDetector:
 
         self.previous_gray = None
         self.prev_gray_2 = None
+        self.prev_valid_2 = None
 
         # --- ESTADOS E CONTADORES ---
         self.kalman_initialized = False
@@ -155,22 +156,92 @@ class BallDetector:
 
         return yellow_mask
 
-    def _create_motion_mask(self, gray):
-        """Diferença de 3 frames centrada no frame atual.
+    def _estimate_camera_motion(self, previous, current):
+        """Transformação afim (translação + rotação + escala) que leva o
+        frame anterior ao atual, estimada por pontos de fundo rastreados
+        com fluxo óptico. Devolve None se não houver pontos suficientes."""
+        scale = 0.5
+        prev_small = cv2.resize(previous, None, fx=scale, fy=scale)
+        cur_small = cv2.resize(current, None, fx=scale, fy=scale)
 
-        Antes combinávamos |t - t-1| OR |t-1 - t-2|, o que acendia também as
-        posições ANTIGAS da bola (t-1 e t-2), gerando 2-3 "fantasmas" por
-        frame que competiam com a posição real. Usando
-        |t - t-1| AND |t - t-2|, só sobrevive o que mudou no frame atual em
-        relação aos dois anteriores: a bola na posição de agora.
+        points = cv2.goodFeaturesToTrack(
+            prev_small, maxCorners=300, qualityLevel=0.01, minDistance=8
+        )
+        if points is None or len(points) < 12:
+            return None
+
+        moved, status, _ = cv2.calcOpticalFlowPyrLK(prev_small, cur_small, points, None)
+        good = status.reshape(-1) == 1
+        if good.sum() < 12:
+            return None
+
+        # RANSAC ignora os pontos dos jogadores/bola (movimento próprio)
+        matrix, _ = cv2.estimateAffinePartial2D(
+            points[good], moved[good], method=cv2.RANSAC, ransacReprojThreshold=1.0
+        )
+        if matrix is None:
+            return None
+
+        matrix[:, 2] /= scale
+        return matrix
+
+    @staticmethod
+    def _robust_difference(current, reference, valid):
+        """Quanto `current` sai da faixa [mín, máx] da vizinhança 3x3 de
+        `reference`. Tolera ~1 px de desalinhamento residual em bordas
+        fortes (rede, linhas, alambrado), que numa diferença simples
+        apareciam como "movimento"; a bola, que se desloca vários pixels
+        por frame, continua fora da faixa."""
+        kernel = np.ones((3, 3), np.uint8)
+        ref_max = cv2.dilate(reference, kernel)
+        ref_min = cv2.erode(reference, kernel)
+        above = cv2.subtract(current, ref_max)
+        below = cv2.subtract(ref_min, current)
+        diff = cv2.max(above, below)
+        diff[valid == 0] = 0
+        return diff
+
+    def _create_motion_mask(self, gray):
+        """Diferença de 3 frames centrada no frame atual, com compensação
+        do movimento da câmera.
+
+        Usamos |t - t-1| AND |t - t-2|: só sobrevive o que mudou no frame
+        atual em relação aos dois anteriores (a bola na posição de agora),
+        sem os "fantasmas" das posições antigas.
+
+        Antes de comparar, os frames anteriores são alinhados ao atual.
+        Com a câmera na mão/tripé tremendo 1-2 px, sem esse alinhamento as
+        bordas da rede, das linhas e do alambrado acendiam como movimento
+        a cada frame e o tracker seguia a rede em vez da bola.
         """
+        height, width = gray.shape[:2]
+
         if self.previous_gray is None:
             self.previous_gray = gray.copy()
             self.prev_gray_2 = gray.copy()
+            self.prev_valid_2 = np.full_like(gray, 255)
             return np.zeros_like(gray, dtype=np.uint8)
 
-        diff1 = cv2.absdiff(gray, self.previous_gray)
-        diff2 = cv2.absdiff(gray, self.prev_gray_2)
+        matrix = self._estimate_camera_motion(self.previous_gray, gray)
+        full_valid = np.full_like(gray, 255)
+
+        if matrix is not None:
+            warp = lambda img, border=0: cv2.warpAffine(
+                img, matrix, (width, height), flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=border,
+            )
+            prev_aligned = warp(self.previous_gray)
+            prev2_aligned = warp(self.prev_gray_2)
+            valid_1 = cv2.erode(warp(full_valid), np.ones((5, 5), np.uint8))
+            valid_2 = cv2.erode(warp(self.prev_valid_2), np.ones((5, 5), np.uint8))
+        else:
+            prev_aligned = self.previous_gray
+            prev2_aligned = self.prev_gray_2
+            valid_1 = full_valid
+            valid_2 = self.prev_valid_2
+
+        diff1 = self._robust_difference(gray, prev_aligned, valid_1)
+        diff2 = self._robust_difference(gray, prev2_aligned, valid_2)
 
         _, motion_1 = cv2.threshold(diff1, 8, 255, cv2.THRESH_BINARY)
         _, motion_2 = cv2.threshold(diff2, 8, 255, cv2.THRESH_BINARY)
@@ -184,7 +255,9 @@ class BallDetector:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         motion_mask = cv2.dilate(motion_mask, kernel, iterations=1)
 
-        self.prev_gray_2 = self.previous_gray
+        # O frame anterior (já alinhado ao atual) vira o t-2 do próximo
+        self.prev_gray_2 = prev_aligned
+        self.prev_valid_2 = valid_1
         self.previous_gray = gray.copy()
         return motion_mask
 

@@ -101,3 +101,39 @@ def test_static_yellow_blob_is_not_detected():
     positions = [(320, 300)] * 30
     results = run(positions)
     assert sum(r is not None for r in results) <= 3
+
+
+def test_camera_shake_does_not_track_the_net():
+    """Câmera tremendo 1-2 px: as bordas da rede/alambrado não podem virar
+    'movimento' e roubar o lugar da bola."""
+    rng = np.random.default_rng(3)
+    big = np.full((HEIGHT + 40, WIDTH + 40, 3), COURT_BGR, dtype=np.uint8)
+    big[:150] = (200, 170, 120)
+    for _ in range(60):
+        x, y = rng.integers(0, WIDTH + 40), rng.integers(0, 150)
+        color = tuple(int(v) for v in rng.integers(40, 230, 3))
+        cv2.rectangle(big, (x, y), (x + rng.integers(10, 60), y + rng.integers(10, 60)), color, -1)
+    for x in range(0, WIDTH + 40, 12):
+        cv2.line(big, (x, 150), (x, 200), (150, 150, 150), 1)
+    cv2.line(big, (60, 215), (WIDTH - 20, 215), (250, 250, 250), 3)
+
+    positions = linear_path(n=50, start=(80, 340), velocity=(9, -4))
+    detector = BallDetector(show_debug=False, verbose_logging=False)
+    correct = wrong = 0
+    for pos in positions:
+        dx, dy = rng.uniform(-2, 2, 2)
+        matrix = np.float32([[1, 0, -20 + dx], [0, 1, -20 + dy]])
+        frame = big.copy()
+        cv2.circle(frame, (pos[0] + 20, pos[1] + 20), 3, BALL_BGR, -1, cv2.LINE_AA)
+        frame = cv2.warpAffine(frame, matrix, (WIDTH, HEIGHT), borderMode=cv2.BORDER_REFLECT)
+        center, _ = detector.detect(frame)
+        if center is None:
+            continue
+        true_x, true_y = pos[0] + dx, pos[1] + dy
+        if np.hypot(center[0] - true_x, center[1] - true_y) <= 5:
+            correct += 1
+        else:
+            wrong += 1
+
+    assert correct >= 40
+    assert wrong <= 3
