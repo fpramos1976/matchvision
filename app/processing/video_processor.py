@@ -1,3 +1,5 @@
+import os
+
 import cv2
 
 from app.calibration.manual_calibration import ManualCalibration
@@ -5,6 +7,7 @@ from app.detection.ball_detector import BallDetector
 from app.detection.player_detector import PlayerDetector
 from app.geometry.homography import Homography
 from app.models.court_model import CourtModel
+from app.models.court_type import CourtType
 from app.utils.configuration import get_match_configuration
 from app.utils.video_reader import open_video
 from app.visualization.court_map import CourtMap
@@ -65,8 +68,18 @@ class VideoProcessor:
         # ==========================================
         # Instancia os Detectores (Jogadores e Bola)
         # ==========================================
-        player_detector = PlayerDetector(confidence=0.5)
-        ball_detector = BallDetector(max_buffer=25)
+        max_players = 4 if configuration.court_type == CourtType.DOUBLES else 2
+        player_detector = PlayerDetector(max_players=max_players)
+        # BALL_DETECTOR=tracknet usa a rede neural (models/tracknet.pt);
+        # sem a variável, fica o detector clássico por cor/movimento.
+        if os.environ.get("BALL_DETECTOR", "").lower() == "tracknet":
+            from app.detection.tracknet_detector import TrackNetBallDetector
+
+            ball_detector = TrackNetBallDetector(fps=fps, max_buffer=25)
+            print(f"Detector de bola: TrackNet ({ball_detector.device})")
+        else:
+            ball_detector = BallDetector(max_buffer=25)
+            print("Detector de bola: clássico (cor/movimento)")
 
         # ==========================================
         # Reabre o vídeo para o Loop
@@ -110,6 +123,11 @@ class VideoProcessor:
 
             # 4. Desenha o rastro da bola no frame original
             frame = ball_detector.draw_ball_trail(frame)
+
+            # Área onde o jogador do fundo é procurado (recorte ampliado)
+            if player_detector.last_far_region is not None:
+                rx1, ry1, rx2, ry2 = player_detector.last_far_region
+                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 255), 1)
 
             # 5. Desenha as caixas e métricas dos jogadores sobre o frame original
             for p in players:
