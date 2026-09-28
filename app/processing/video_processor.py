@@ -5,6 +5,7 @@ from app.detection.ball_detector import BallDetector
 from app.detection.player_detector import PlayerDetector
 from app.geometry.homography import Homography
 from app.models.court_model import CourtModel
+from app.models.court_type import CourtType
 from app.utils.configuration import get_match_configuration
 from app.utils.video_reader import open_video
 from app.visualization.court_map import CourtMap
@@ -65,7 +66,8 @@ class VideoProcessor:
         # ==========================================
         # Instancia os Detectores (Jogadores e Bola)
         # ==========================================
-        player_detector = PlayerDetector(confidence=0.5)
+        max_players = 4 if configuration.court_type == CourtType.DOUBLES else 2
+        player_detector = PlayerDetector(max_players=max_players)
         ball_detector = BallDetector(max_buffer=25)
 
         # ==========================================

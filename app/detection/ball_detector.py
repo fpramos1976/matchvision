@@ -5,7 +5,7 @@ import numpy as np
 
 class BallDetector:
 
-    def __init__(self, max_buffer=30):
+    def __init__(self, max_buffer=30, show_debug=True, verbose_logging=True):
         self.max_buffer = max_buffer
 
         self.trajectory_pixels = collections.deque(maxlen=max_buffer)
@@ -21,8 +21,8 @@ class BallDetector:
         self.static_frames_count = 0
         self.last_confirmed_center = None
         self.frame_number = 0
-        self.show_debug = True
-        self.verbose_logging = True
+        self.show_debug = show_debug
+        self.verbose_logging = verbose_logging
 
         self.blocked_static_points = []
         self.bounces = []
@@ -156,24 +156,35 @@ class BallDetector:
         return yellow_mask
 
     def _create_motion_mask(self, gray):
-        """Acumulador de movimento em 3 frames consecutivos para revelar pontos minúsculos."""
+        """Diferença de 3 frames centrada no frame atual.
+
+        Antes combinávamos |t - t-1| OR |t-1 - t-2|, o que acendia também as
+        posições ANTIGAS da bola (t-1 e t-2), gerando 2-3 "fantasmas" por
+        frame que competiam com a posição real. Usando
+        |t - t-1| AND |t - t-2|, só sobrevive o que mudou no frame atual em
+        relação aos dois anteriores: a bola na posição de agora.
+        """
         if self.previous_gray is None:
             self.previous_gray = gray.copy()
             self.prev_gray_2 = gray.copy()
             return np.zeros_like(gray, dtype=np.uint8)
 
         diff1 = cv2.absdiff(gray, self.previous_gray)
-        diff2 = cv2.absdiff(self.previous_gray, self.prev_gray_2)
+        diff2 = cv2.absdiff(gray, self.prev_gray_2)
 
-        # Combina o movimento entre t, t-1 e t-2
-        motion_combined = cv2.bitwise_or(diff1, diff2)
-        _, motion_mask = cv2.threshold(motion_combined, 8, 255, cv2.THRESH_BINARY)
+        _, motion_1 = cv2.threshold(diff1, 8, 255, cv2.THRESH_BINARY)
+        _, motion_2 = cv2.threshold(diff2, 8, 255, cv2.THRESH_BINARY)
+        motion_mask = cv2.bitwise_and(motion_1, motion_2)
 
         # Filtro de sombras escuras do piso
         _, bright_mask = cv2.threshold(gray, 65, 255, cv2.THRESH_BINARY)
         motion_mask = cv2.bitwise_and(motion_mask, bright_mask)
 
-        self.prev_gray_2 = self.previous_gray.copy()
+        # Reconecta pixels da bola que o AND pode ter fragmentado
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        motion_mask = cv2.dilate(motion_mask, kernel, iterations=1)
+
+        self.prev_gray_2 = self.previous_gray
         self.previous_gray = gray.copy()
         return motion_mask
 
@@ -195,6 +206,48 @@ class BallDetector:
 
         return search_mask
 
+    @staticmethod
+    def _calibrated_min_y(homography):
+        """Linha (y em pixels) mais alta entre os 4 cantos calibrados."""
+        return min(
+            homography.image_points.top_left[1],
+            homography.image_points.top_right[1],
+            homography.image_points.bottom_right[1],
+            homography.image_points.bottom_left[1],
+        )
+
+    @staticmethod
+    def _box_coords(box):
+        if hasattr(box, "xyxy"):
+            return tuple(map(int, box.xyxy[0].cpu().numpy()))
+        return tuple(map(int, box[:4]))
+
+    def _player_box_containing(self, center, player_boxes, pad=5):
+        for box in player_boxes or []:
+            try:
+                x1, y1, x2, y2 = self._box_coords(box)
+            except Exception:
+                continue
+            if x1 - pad <= center[0] <= x2 + pad and y1 - pad <= center[1] <= y2 + pad:
+                return True
+        return False
+
+    @staticmethod
+    def _mask_ratio(mask, contour, bounding_rect):
+        """Fração dos pixels do contorno que estão acesos em `mask`.
+
+        Mais robusto do que ler apenas o pixel central: em bolas de 2-4 px
+        o centro arredondado frequentemente cai fora da máscara.
+        """
+        x, y, w, h = bounding_rect
+        local = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(local, [contour], -1, 255, -1, offset=(-x, -y))
+        total = cv2.countNonZero(local)
+        if total == 0:
+            return 0.0
+        hits = cv2.countNonZero(cv2.bitwise_and(local, mask[y:y + h, x:x + w]))
+        return hits / total
+
     def _is_inside_court(self, center, homography, court_model):
         if homography is None or court_model is None:
             return True, None
@@ -213,12 +266,7 @@ class BallDetector:
         # Por isso não aplicamos o filtro geométrico aqui: confiamos nos
         # outros filtros (cor, movimento, continuidade do Kalman) para
         # decidir se o candidato é válido.
-        calibrated_min_y = min(
-            homography.image_points.top_left[1],
-            homography.image_points.top_right[1],
-            homography.image_points.bottom_right[1],
-            homography.image_points.bottom_left[1],
-        )
+        calibrated_min_y = self._calibrated_min_y(homography)
 
         if center[1] < calibrated_min_y:
             return True, (world_x, world_y)
@@ -261,18 +309,19 @@ class BallDetector:
 
         score += min(15.0, circularity * 15.0)
 
-        if motion_value > 0:
-            score += 30.0
+        # Proporcionais à fração do contorno com movimento / cor, em vez de
+        # um bônus binário baseado apenas no pixel central.
+        score += 30.0 * motion_value
 
         if yellow_value > 0:
-            score += 20.0
+            score += 20.0 * yellow_value
             # O bônus de campo distante só se aplica quando também há
             # sinal de cor - sem isso, ruído de fundo (folhas, sombras)
             # em campo distante ganhava pontos apenas por estar longe,
             # o que causava falsos positivos sem nenhuma relação com a
             # cor real da bola.
             if is_far_field:
-                score += 15.0
+                score += 15.0 * yellow_value
 
         if predicted_point is not None:
             distance = float(
@@ -350,15 +399,15 @@ class BallDetector:
         # normal em saques). Sem homografia, usamos o valor fixo antigo
         # como fallback.
         if homography is not None:
-            calibrated_min_y = min(
-                homography.image_points.top_left[1],
-                homography.image_points.top_right[1],
-                homography.image_points.bottom_right[1],
-                homography.image_points.bottom_left[1],
-            )
+            calibrated_min_y = self._calibrated_min_y(homography)
             roi_top = max(0, int(calibrated_min_y - height * 0.6))
+            # Um toss de saque parado só é plausível bem acima da linha
+            # mais alta calibrada (não na altura da rede, onde há ilhós e
+            # parafusos fixos confundidos com a bola).
+            high_altitude_threshold = calibrated_min_y - height * 0.25
         else:
             roi_top = int(height * 0.25)
+            high_altitude_threshold = height * 0.15
 
         roi_mask = np.zeros((height, width), dtype=np.uint8)
         roi_mask[roi_top:, :] = 255
@@ -374,11 +423,17 @@ class BallDetector:
         # para ser avaliado, mas o score final (_score_candidate)
         # ainda decide se ele é aceito.
         motion_or_color_mask = cv2.bitwise_or(motion_mask, yellow_mask)
-        combined_mask = cv2.bitwise_and(motion_or_color_mask, player_mask)
-        combined_mask = cv2.bitwise_and(combined_mask, roi_mask)
+        combined_mask = cv2.bitwise_and(motion_or_color_mask, roi_mask)
 
-        if self.kalman_initialized:
+        # Com o Kalman ativo, a região dos jogadores NÃO é apagada: é
+        # justamente no momento da raquetada que a bola passa colada ao
+        # corpo, e apagar a caixa inteira fazia o tracker perder a bola
+        # em todo golpe. Candidatos dentro da caixa passam por um filtro
+        # mais rígido (perto da previsão + cor amarela) no loop abaixo.
+        if self.kalman_initialized and predicted_point is not None:
             combined_mask = cv2.bitwise_and(combined_mask, search_mask)
+        else:
+            combined_mask = cv2.bitwise_and(combined_mask, player_mask)
 
         # 5. Filtrar Contornos de Múltiplos Tamanhos
         contours, _ = cv2.findContours(
@@ -396,11 +451,22 @@ class BallDetector:
             if radius < 0.2 or radius > 15.0:
                 continue
 
-            center = (int(x), int(y))
+            # Centróide pelos momentos (mais estável que o centro do
+            # círculo envolvente para blobs borrados pelo movimento).
+            moments = cv2.moments(contour)
+            if moments["m00"] > 0:
+                x = moments["m10"] / moments["m00"]
+                y = moments["m01"] / moments["m00"]
+
+            center = (
+                min(width - 1, max(0, int(round(x)))),
+                min(height - 1, max(0, int(round(y)))),
+            )
             is_far_field = center[1] < int(height * 0.55)
 
             # Contorno de linhas horizontais extensas (ex: rede)
-            x_bound, y_bound, w_bound, h_bound = cv2.boundingRect(contour)
+            bounding_rect = cv2.boundingRect(contour)
+            _, _, w_bound, h_bound = bounding_rect
             aspect_ratio = float(w_bound) / float(max(1, h_bound))
             if aspect_ratio > 3.5:
                 continue
@@ -416,25 +482,6 @@ class BallDetector:
             if circularity < 0.05:
                 continue
 
-            # Elimina contornos dentro da caixa do jogador
-            is_player_body = False
-            if player_boxes:
-                for box in player_boxes:
-                    try:
-                        bx1, by1, bx2, by2 = map(
-                            int,
-                            box[:4]
-                            if isinstance(box, (list, tuple, np.ndarray))
-                            else box.xyxy[0],
-                        )
-                        if bx1 <= center[0] <= bx2 and by1 <= center[1] <= by2:
-                            is_player_body = True
-                            break
-                    except Exception:
-                        pass
-            if is_player_body:
-                continue
-
             if self._is_point_blacklisted(center):
                 continue
 
@@ -444,45 +491,33 @@ class BallDetector:
             if not inside_court:
                 continue
 
-            center_x = min(width - 1, max(0, center[0]))
-            center_y = min(height - 1, max(0, center[1]))
+            yellow_val = self._mask_ratio(yellow_mask, contour, bounding_rect)
+            motion_val = self._mask_ratio(motion_mask, contour, bounding_rect)
 
-            yellow_val = int(yellow_mask[center_y, center_x])
-            motion_val = int(motion_mask[center_y, center_x])
+            # Candidato junto ao corpo do jogador: só é aceito se estiver
+            # colado à previsão do Kalman e tiver cor de bola. Sem isso,
+            # braços, raquete e roupa em movimento viram falsos positivos.
+            if self._player_box_containing(center, player_boxes):
+                if predicted_point is None:
+                    continue
+                dist_pred = np.hypot(
+                    center[0] - predicted_point[0],
+                    center[1] - predicted_point[1],
+                )
+                if dist_pred > 45.0 or yellow_val < 0.3:
+                    continue
 
-            if motion_val == 0 and yellow_val > 0:
-                # is_far_field (y < 55% da altura) é muito permissivo para
-                # este filtro - ele inclui toda a altura da rede, que é
-                # exatamente onde vimos elementos fixos (ilhós, parafusos)
-                # sendo confundidos com a bola. Um toss de saque parado só
-                # é plausível bem acima da linha mais alta calibrada, não
-                # em qualquer ponto da metade superior do frame.
-                if homography is not None:
-                    calibrated_min_y = min(
-                        homography.image_points.top_left[1],
-                        homography.image_points.top_right[1],
-                        homography.image_points.bottom_right[1],
-                        homography.image_points.bottom_left[1],
-                    )
-                    high_altitude_threshold = calibrated_min_y - height * 0.25
-                else:
-                    high_altitude_threshold = height * 0.15
-
+            # Um candidato que só tem sinal de cor, sem movimento relevante,
+            # é o caso mais explorado por elementos estáticos e amarelados
+            # do fundo (faixas de propaganda, fita da rede sob luz forte).
+            # Para esse caso exigimos que esteja bem alto (toss do saque)
+            # e geometria muito mais estrita - quase um círculo perfeito
+            # e raio pequeno.
+            if motion_val < 0.1 and yellow_val > 0:
                 if center[1] > high_altitude_threshold:
                     continue
                 if circularity < 0.55 or radius > 6.0:
                     continue
-
-            # Um candidato que só tem sinal de cor, sem nenhum movimento,
-            # é o caso mais explorado por elementos estáticos e amarelados
-            # do fundo (faixas de propaganda, fita da rede sob luz forte).
-            # Para esse caso específico, exigimos geometria muito mais
-            # estrita - quase um círculo perfeito e raio pequeno - já que
-            # a bola raramente fica perfeitamente parada por vários frames.
-            if motion_val == 0 and yellow_val > 0:
-                if circularity < 0.55 or radius > 6.0:
-                    continue
-
 
             score = self._score_candidate(
                 center,
@@ -503,6 +538,8 @@ class BallDetector:
                     "circularity": circularity,
                     "score": score,
                     "world_pos": candidate_world,
+                    "yellow": yellow_val,
+                    "motion": motion_val,
                 }
             )
 
@@ -545,10 +582,8 @@ class BallDetector:
             if candidates:
                 best = max(candidates, key=lambda c: c["score"])
                 bx, by = best["center"]
-                by_clamped = min(height - 1, max(0, by))
-                bx_clamped = min(width - 1, max(0, bx))
-                best_yellow = int(yellow_mask[by_clamped, bx_clamped])
-                best_motion = int(motion_mask[by_clamped, bx_clamped])
+                best_yellow = round(best["yellow"], 2)
+                best_motion = round(best["motion"], 2)
                 best_candidate_info = (
                     f"pos=({bx},{by}) yellow={best_yellow} motion={best_motion}"
                 )
