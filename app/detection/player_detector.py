@@ -59,6 +59,7 @@ class PlayerDetector:
 
         # Histórico dos jogadores: {track_id: {"last_world_pos": (x, y), "total_distance": 0.0, "speed": 0.0}}
         self.players_stats = {}
+        self.last_far_region = None
 
     def _distance_outside_court(self, world_x, world_y, court_model):
         """Distância (m) do ponto até o retângulo da quadra; 0 se dentro."""
@@ -211,6 +212,9 @@ class PlayerDetector:
         detections = self._run_model(frame, self.confidence, self.image_size)
 
         region = self._far_court_region(frame.shape, homography, court_model)
+        if self.frame_number == 1:
+            print(f"[PlayerDetector] recorte do fundo: {region}")
+        self.last_far_region = region
         if region is not None:
             x1, y1, x2, y2 = region
             for det in self._run_model(

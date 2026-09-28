@@ -113,6 +113,11 @@ class VideoProcessor:
             # 4. Desenha o rastro da bola no frame original
             frame = ball_detector.draw_ball_trail(frame)
 
+            # Área onde o jogador do fundo é procurado (recorte ampliado)
+            if player_detector.last_far_region is not None:
+                rx1, ry1, rx2, ry2 = player_detector.last_far_region
+                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 0, 255), 1)
+
             # 5. Desenha as caixas e métricas dos jogadores sobre o frame original
             for p in players:
                 x1, y1, x2, y2 = p["bbox"]
