@@ -1,1 +1,10 @@
-python -m app.main
+# MatchVision
+
+## Como rodar
+
+```
+uv run python -m app.main                          # vídeo padrão (videos/tennis_3.mp4)
+uv run python -m app.main videos/tennis_1.mp4      # outro vídeo
+uv run python -m app.main videos/tennis_1.mp4 --tracknet   # bola com TrackNet
+uv run python -m app.main --help                   # todas as opções
+```
