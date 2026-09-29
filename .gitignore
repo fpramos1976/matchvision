@@ -5,3 +5,4 @@ generate_tracknet_model.py
 convert_real_tracknet.py
 __pycache__/
 *.pyc
+videos/*.mp4
