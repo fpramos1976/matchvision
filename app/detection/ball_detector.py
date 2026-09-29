@@ -33,6 +33,16 @@ class BallDetector:
         # têm candidatos alinhados numa trajetória de velocidade constante:
         # um ponto isolado (folha, reflexo, tênis do jogador) não basta.
         self.pending_candidates = collections.deque(maxlen=3)
+        self.court_hue = None
+
+        # Frames seguidos em que a bola aceita estava na zona de um jogador
+        self.frames_in_player_zone = 0
+        self.max_frames_in_player_zone = 4
+
+        # Os limites de tamanho foram ajustados para vídeos ~720p; em
+        # resolução maior a bola ocupa proporcionalmente mais pixels (em
+        # 1080p ~16 px de diâmetro, >30 px perto da câmera).
+        self.size_scale = 1.0
 
         # Alargamento lateral da zona do jogador (fração da largura da
         # caixa), onde uma trajetória nova não pode começar.
@@ -68,6 +78,7 @@ class BallDetector:
         self.last_confirmed_center = None
         self.confirmed_positions_history.clear()
         self.pending_candidates.clear()
+        self.frames_in_player_zone = 0
 
         self.kalman.statePre = np.zeros((4, 1), dtype=np.float32)
         self.kalman.statePost = np.zeros((4, 1), dtype=np.float32)
@@ -142,6 +153,21 @@ class BallDetector:
 
         return player_mask
 
+    @staticmethod
+    def _estimate_court_hue(hsv):
+        """Matiz predominante do piso (metade de baixo do frame, pixels
+        saturados), usado para afastar a faixa "amarela" da cor da quadra."""
+        height = hsv.shape[0]
+        floor = hsv[int(height * 0.55):, :].reshape(-1, 3)
+        saturated = floor[floor[:, 1] > 60]
+        if len(saturated) < 100:
+            return 0
+        hues = saturated[:, 0].astype(int)
+        # Só interessa se o piso for alaranjado/avermelhado (H < 20);
+        # quadras verdes/azuis não se sobrepõem à bola.
+        dominant = int(np.bincount(hues, minlength=180).argmax())
+        return dominant if dominant < 20 else 0
+
     def _create_yellow_mask(self, frame):
         """Mascara HSV calibrada com pixels reais da bola do vídeo
         tennis_2.mp4 (medidos com tests/inspect_ball_color.py):
@@ -158,7 +184,14 @@ class BallDetector:
         """
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        lower_yellow = np.array([10, 80, 130], dtype=np.uint8)
+        # A faixa de matiz começa acima da cor do piso. Em quadra de
+        # saibro (tennis_1.mp4) o piso tem H ~11-12 e a bola H ~16-24: com
+        # o limite fixo em 10 a quadra INTEIRA virava "amarelo".
+        if self.court_hue is None:
+            self.court_hue = self._estimate_court_hue(hsv)
+        lower_hue = max(10, self.court_hue + 4)
+
+        lower_yellow = np.array([lower_hue, 80, 130], dtype=np.uint8)
         upper_yellow = np.array([30, 255, 255], dtype=np.uint8)
 
         yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
@@ -398,9 +431,9 @@ class BallDetector:
         score += 20.0 * bright_value
 
         # Aceita áreas e raios substancialmente mais pequenos
-        ideal_radius = 2.5 if is_far_field else 4.0
+        ideal_radius = (2.5 if is_far_field else 4.0) * self.size_scale
         radius_diff = abs(radius - ideal_radius)
-        score += max(0.0, 25.0 - (radius_diff * 5.0))
+        score += max(0.0, 25.0 - (radius_diff * 5.0 / self.size_scale))
 
         score += min(15.0, circularity * 15.0)
 
@@ -480,7 +513,7 @@ class BallDetector:
                 p1, p2 = c1["center"], c2["center"]
                 step = np.hypot(p2[0] - p1[0], p2[1] - p1[1])
                 # Parado não é bola em jogo; salto enorme é outro objeto
-                if step < 1.0 or step > 60.0:
+                if step < 1.0 or step > 120.0 * self.size_scale:
                     continue
                 expected = (2 * p2[0] - p1[0], 2 * p2[1] - p1[1])
                 for c3 in frames[2]:
@@ -506,6 +539,7 @@ class BallDetector:
         self.kalman.errorCovPost = np.eye(4, dtype=np.float32) * 10.0
         self.kalman_initialized = True
         self.pending_candidates.clear()
+        self.frames_in_player_zone = 0
         self.confirmed_positions_history.clear()
         self.confirmed_positions_history.extend([p1, p2])
         self.last_confirmed_center = p2
@@ -519,6 +553,7 @@ class BallDetector:
     ):
         self.frame_number += 1
         height, width = frame.shape[:2]
+        self.size_scale = max(1.0, height / 720.0)
 
         if self.frame_number % 120 == 0:
             self.blocked_static_points.clear()
@@ -601,11 +636,11 @@ class BallDetector:
         for contour in contours:
             area = cv2.contourArea(contour)
             # Permite objetos de 0.2px até 150px
-            if area < 0.2 or area > 150.0:
+            if area < 0.2 or area > 150.0 * self.size_scale ** 2:
                 continue
 
             (x, y), radius = cv2.minEnclosingCircle(contour)
-            if radius < 0.2 or radius > 15.0:
+            if radius < 0.2 or radius > 15.0 * self.size_scale:
                 continue
 
             # Centróide pelos momentos (mais estável que o centro do
@@ -659,6 +694,11 @@ class BallDetector:
             if near_player:
                 if predicted_point is None:
                     continue
+                # A bola só passa alguns frames colada ao jogador (o
+                # golpe); um braço ou a raquete ficam ali o tempo todo e
+                # "sequestravam" o tracker (tennis_1.mp4, frames 158-163).
+                if self.frames_in_player_zone >= self.max_frames_in_player_zone:
+                    continue
                 dist_pred = np.hypot(
                     center[0] - predicted_point[0],
                     center[1] - predicted_point[1],
@@ -675,7 +715,7 @@ class BallDetector:
             if motion_val < 0.1 and yellow_val > 0:
                 if center[1] > high_altitude_threshold:
                     continue
-                if circularity < 0.55 or radius > 6.0:
+                if circularity < 0.55 or radius > 6.0 * self.size_scale:
                     continue
 
             score = self._score_candidate(
@@ -718,7 +758,11 @@ class BallDetector:
         if self.kalman_initialized and predicted_point is not None:
             # Rastreando: só aceita candidatos dentro de uma janela em volta
             # da previsão, que cresce enquanto a bola está sumida.
-            gate = 15.0 + 8.0 * self.missed_frames
+            # A janela acompanha a resolução e a velocidade atual da bola:
+            # em 1080p a 24 fps uma bola rápida anda 40-90 px por frame e
+            # o erro da previsão cresce junto.
+            speed = float(np.hypot(self.kalman.statePost[2][0], self.kalman.statePost[3][0]))
+            gate = (15.0 + 8.0 * self.missed_frames) * self.size_scale + 0.5 * speed
             for candidate in candidates:
                 cand_center = candidate["center"]
                 dist_pred = np.hypot(
@@ -731,6 +775,10 @@ class BallDetector:
                     continue
                 ball_center = cand_center
                 world_pos = candidate["world_pos"]
+                if candidate["near_player"]:
+                    self.frames_in_player_zone += 1
+                else:
+                    self.frames_in_player_zone = 0
                 break
 
         if ball_center is None and (
