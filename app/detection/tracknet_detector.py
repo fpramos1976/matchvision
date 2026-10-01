@@ -92,17 +92,25 @@ class TrackNetBallDetector:
         self.model.load_state_dict(state)
         self.model.to(self.device).eval()
 
-        # A rede foi treinada a 30 fps. Em vídeos de 60 fps a bola anda
-        # metade por frame e a rede a confunde com algo parado; por isso
-        # usamos frames espaçados (t, t-2, t-4) para reproduzir o
-        # deslocamento que ela viu no treino.
-        self.frame_step = max(1, int(round(fps / 30.0)))
+        # Três frames consecutivos (t, t-1, t-2), como no treino. Testamos
+        # espaçar os frames em vídeos de 60 fps (t, t-2, t-4): no
+        # trecho_hd.mp4 isso gerou 3 detecções erradas contra 0 com frames
+        # vizinhos, para o mesmo número de acertos.
+        self.frame_step = 1
         self.frames = collections.deque(maxlen=2 * self.frame_step + 1)
 
         self.heatmap_threshold = heatmap_threshold
-        # Saltos maiores que isto (em pixels do frame) entre detecções
-        # seguidas são tratados como falso positivo.
+        # Saltos maiores que isto entre detecções seguidas são tratados
+        # como falso positivo. O valor é em pixels de um vídeo 1280 px de
+        # largura e é escalado para a resolução real.
         self.max_jump = max_jump
+
+        # Buracos curtos na trajetória (a rede perde a bola colada ao
+        # jogador) são preenchidos por interpolação quando a bola
+        # reaparece perto. ~1/6 s: 10 frames a 60 fps, 4 a 24 fps. No
+        # trecho_hd.mp4 isso levou de 27 para 38 acertos em 46 quadros
+        # conferidos, sem nenhuma posição errada.
+        self.max_gap = max(1, int(round(fps / 6.0)))
 
         self.trajectory_pixels = collections.deque(maxlen=max_buffer)
         self.trajectory_world = collections.deque(maxlen=max_buffer)
@@ -144,18 +152,16 @@ class TrackNetBallDetector:
                     int(round(spot[1] * height / self.INPUT_HEIGHT)),
                 )
 
+        max_jump = self.max_jump * frame.shape[1] / 1280.0
         if center is not None and self.last_center is not None and self.missed_frames < 4:
             jump = np.hypot(center[0] - self.last_center[0], center[1] - self.last_center[1])
-            if jump > self.max_jump * (1 + self.missed_frames):
+            if jump > max_jump * (1 + self.missed_frames):
                 center = None
 
         world_pos = None
         if center is not None:
-            if homography is not None:
-                try:
-                    world_pos = homography.transform_point_to_world(center)
-                except Exception:
-                    world_pos = None
+            world_pos = self._to_world(center, homography)
+            self._fill_gap(center, homography, max_jump)
             self.last_center = center
             self.missed_frames = 0
         else:
@@ -164,6 +170,37 @@ class TrackNetBallDetector:
         self.trajectory_pixels.appendleft(center)
         self.trajectory_world.appendleft(world_pos)
         return center, world_pos
+
+    @staticmethod
+    def _to_world(point, homography):
+        if homography is None:
+            return None
+        try:
+            return homography.transform_point_to_world(point)
+        except Exception:
+            return None
+
+    def _fill_gap(self, center, homography, max_jump):
+        """Se a bola reaparece depois de poucos frames sumida e perto de
+        onde estava, preenche o rastro (pixels e mundo) desses frames por
+        interpolação linear. Não atrasa a saída: só o histórico muda."""
+        gap = self.missed_frames
+        if self.last_center is None or not 0 < gap <= self.max_gap:
+            return
+        if gap > len(self.trajectory_pixels) - 1:
+            return
+        x0, y0 = self.last_center
+        if np.hypot(center[0] - x0, center[1] - y0) > max_jump * (gap + 1):
+            return
+        # trajectory_pixels[0] é o frame anterior; [gap] é a última detecção
+        for i in range(gap):
+            t = (gap - i) / (gap + 1.0)
+            point = (
+                int(round(x0 + (center[0] - x0) * t)),
+                int(round(y0 + (center[1] - y0) * t)),
+            )
+            self.trajectory_pixels[i] = point
+            self.trajectory_world[i] = self._to_world(point, homography)
 
     def draw_ball_trail(self, frame):
         """Desenha a linha amarela de trajetória e o marcador da bola."""
