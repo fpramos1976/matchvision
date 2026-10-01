@@ -17,11 +17,31 @@ class VideoProcessor:
 
     def __init__(self, video_path: str, ball_detector: str | None = None):
         self.video_path = video_path
-        # "tracknet" ou None (clássico). Sem valor explícito, respeita a
-        # variável de ambiente BALL_DETECTOR, que continua funcionando.
+        # "tracknet" (padrão) ou "classico". Sem valor explícito, respeita
+        # a variável de ambiente BALL_DETECTOR.
         self.ball_detector = (
-            ball_detector or os.environ.get("BALL_DETECTOR", "")
+            ball_detector or os.environ.get("BALL_DETECTOR") or "tracknet"
         ).lower()
+
+    def _create_ball_detector(self, fps):
+        """TrackNet por padrão (nos vídeos medidos acertou muito mais que o
+        clássico). Se os pesos ou o PyTorch não estiverem disponíveis, cai
+        para o detector clássico em vez de interromper a análise."""
+        if self.ball_detector != "classico":
+            try:
+                from app.detection.tracknet_detector import TrackNetBallDetector
+
+                detector = TrackNetBallDetector(fps=fps, max_buffer=25)
+                print(f"Detector de bola: TrackNet ({detector.device})")
+                return detector
+            except Exception as error:
+                print(
+                    f"Aviso: TrackNet indisponível ({error}). "
+                    "Usando o detector clássico."
+                )
+
+        print("Detector de bola: clássico (cor/movimento)")
+        return BallDetector(max_buffer=25)
 
     def run(self):
         print("Hello from MatchVision!")
@@ -75,16 +95,7 @@ class VideoProcessor:
         # ==========================================
         max_players = 4 if configuration.court_type == CourtType.DOUBLES else 2
         player_detector = PlayerDetector(max_players=max_players)
-        # "tracknet" usa a rede neural (models/tracknet.pt); caso
-        # contrário, fica o detector clássico por cor/movimento.
-        if self.ball_detector == "tracknet":
-            from app.detection.tracknet_detector import TrackNetBallDetector
-
-            ball_detector = TrackNetBallDetector(fps=fps, max_buffer=25)
-            print(f"Detector de bola: TrackNet ({ball_detector.device})")
-        else:
-            ball_detector = BallDetector(max_buffer=25)
-            print("Detector de bola: clássico (cor/movimento)")
+        ball_detector = self._create_ball_detector(fps)
 
         # ==========================================
         # Reabre o vídeo para o Loop

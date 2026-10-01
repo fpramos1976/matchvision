@@ -17,16 +17,23 @@ def parse_args(argv=None):
         help=f"caminho do vídeo (padrão: {DEFAULT_VIDEO})",
     )
     parser.add_argument(
-        "--tracknet",
+        "--classico",
         action="store_true",
-        help="detecta a bola com a rede neural TrackNet (models/tracknet.pt)",
+        help="detecta a bola pelo método clássico (cor/movimento) em vez do TrackNet",
     )
+    # Mantida por compatibilidade: o TrackNet já é o padrão.
+    parser.add_argument("--tracknet", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
-    ball_detector = "tracknet" if args.tracknet else None
+    if args.classico:
+        ball_detector = "classico"
+    elif args.tracknet:
+        ball_detector = "tracknet"
+    else:
+        ball_detector = None
     processor = VideoProcessor(args.video, ball_detector=ball_detector)
     processor.run()
 
