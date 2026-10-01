@@ -1,4 +1,6 @@
 import os
+import time
+from pathlib import Path
 
 import cv2
 
@@ -11,12 +13,25 @@ from app.models.court_type import CourtType
 from app.utils.configuration import get_match_configuration
 from app.utils.video_reader import open_video
 from app.visualization.court_map import CourtMap
+from app.visualization.playback import compose_frame, play_video
 
 
 class VideoProcessor:
 
-    def __init__(self, video_path: str, ball_detector: str | None = None):
+    def __init__(
+        self,
+        video_path: str,
+        ball_detector: str | None = None,
+        output_path: str | None = None,
+        play: bool = True,
+    ):
         self.video_path = video_path
+        # Vídeo anotado gravado durante o processamento e reproduzido
+        # depois na velocidade original.
+        self.output_path = output_path or str(
+            Path("output") / f"{Path(video_path).stem}_analise.mp4"
+        )
+        self.play = play
         # "tracknet" (padrão) ou "classico". Sem valor explícito, respeita
         # a variável de ambiente BALL_DETECTOR.
         self.ball_detector = (
@@ -62,7 +77,6 @@ class VideoProcessor:
         fps = video.get(cv2.CAP_PROP_FPS)
         if fps <= 0:
             fps = 30
-        frame_delay = max(1, int(1000 / fps))
 
         # Primeiro frame para calibração manual
         ret, frame = video.read()
@@ -110,10 +124,20 @@ class VideoProcessor:
         # ==========================================
         # Loop do Processamento de Vídeo
         # ==========================================
+        # A análise é mais lenta que o vídeo (sobretudo em 4K/60 fps), então
+        # cada quadro anotado é gravado em arquivo e a reprodução na
+        # velocidade normal acontece no fim. Durante o processamento a
+        # janela mostra uma prévia, sem esperar entre quadros.
+        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
+        writer = None
+        processed = 0
+        started = time.perf_counter()
+        interrupted = False
+
         while True:
             ret, frame = video.read()
             if not ret:
-                print("Fim do vídeo.")
                 break
 
             # 1. Detecta e Rastreia os Jogadores
@@ -163,14 +187,46 @@ class VideoProcessor:
                     2,
                 )
 
-            # Janelas de exibição
-            cv2.imshow("Original", frame)
-            cv2.imshow("Bird's-Eye View (SwingVision)", bird_view)
+            # 6. Grava o quadro anotado (vídeo + mapa da quadra lado a lado)
+            composed = compose_frame(frame, bird_view)
+            if writer is None:
+                height, width = composed.shape[:2]
+                writer = cv2.VideoWriter(
+                    self.output_path,
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    fps,
+                    (width, height),
+                )
+            writer.write(composed)
+            processed += 1
 
-            tecla = cv2.waitKey(frame_delay) & 0xFF
-            if tecla == ord("q"):
-                print("Processamento interrompido pelo usuário.")
+            # Prévia e progresso (sem segurar o processamento)
+            cv2.imshow("MatchVision - Processando", composed)
+            elapsed = time.perf_counter() - started
+            rate = processed / elapsed if elapsed > 0 else 0.0
+            if total_frames:
+                remaining = (total_frames - processed) / rate if rate > 0 else 0
+                print(
+                    f"\rProcessando: {processed}/{total_frames} quadros "
+                    f"({100 * processed / total_frames:.0f}%) - "
+                    f"{rate:.1f} quadros/s - faltam ~{remaining:.0f}s   ",
+                    end="",
+                    flush=True,
+                )
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                print("\nProcessamento interrompido pelo usuário.")
+                interrupted = True
                 break
+
+        print()
+        if writer is not None:
+            writer.release()
+            print(f"Vídeo analisado salvo em: {self.output_path}")
+        cv2.destroyWindow("MatchVision - Processando")
+
+        if self.play and writer is not None and not interrupted:
+            play_video(self.output_path, fps)
 
         video.release()
         cv2.destroyAllWindows()

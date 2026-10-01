@@ -21,6 +21,15 @@ def parse_args(argv=None):
         action="store_true",
         help="detecta a bola pelo método clássico (cor/movimento) em vez do TrackNet",
     )
+    parser.add_argument(
+        "--saida",
+        help="arquivo do vídeo analisado (padrão: output/<nome>_analise.mp4)",
+    )
+    parser.add_argument(
+        "--sem-reproducao",
+        action="store_true",
+        help="só processa e grava o vídeo analisado, sem reproduzir no fim",
+    )
     # Mantida por compatibilidade: o TrackNet já é o padrão.
     parser.add_argument("--tracknet", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
@@ -34,7 +43,12 @@ def main(argv=None):
         ball_detector = "tracknet"
     else:
         ball_detector = None
-    processor = VideoProcessor(args.video, ball_detector=ball_detector)
+    processor = VideoProcessor(
+        args.video,
+        ball_detector=ball_detector,
+        output_path=args.saida,
+        play=not args.sem_reproducao,
+    )
     processor.run()
 
 
