@@ -24,6 +24,9 @@ def make_detector(fps, seen):
     detector.color_rescue = False
     detector.velocity = (0.0, 0.0)
     detector.rescue_streak = 0
+    detector._recent = collections.deque(
+        maxlen=max(6, int(round(fps * TrackNetBallDetector.STATIONARY_SECONDS)))
+    )
     detector._heatmap = lambda: None
     spots = iter(seen)
     # Coordenadas injetadas já em pixels de 640x360 (frame de mesmo tamanho)
@@ -59,3 +62,25 @@ def test_gap_after_jump_is_not_filled():
     seen = [(100, 200), (110, 200), None, (600, 50)]
     _, trail = run(60, seen)
     assert trail[2] is None
+
+
+def test_ball_rolling_on_ground_is_hidden_after_one_second():
+    # Bola fora de jogo rolando ~2,5 px/quadro num vídeo de 1920 px (como
+    # no tennis_2.mp4); o quadro do teste tem 640 px, daí ~0,8 px/quadro
+    seen = [(int(round(400 - 0.8 * i)), 300) for i in range(40)]
+    outputs, _ = run(24, seen)
+    window = int(round(24 * TrackNetBallDetector.STATIONARY_SECONDS))
+    assert all(o is not None for o in outputs[: window - 1])
+    assert all(o is None for o in outputs[window:])
+
+
+def test_slow_ball_near_top_of_lob_is_kept():
+    # Bola em jogo que desacelera por ~0,4 s no topo da trajetória (em
+    # pixels do quadro de 640 px do teste)
+    xs, x = [], 100.0
+    for i in range(50):
+        x += 1 if 20 <= i < 30 else 6
+        xs.append(int(x))
+    seen = [(x, 200) for x in xs]
+    outputs, _ = run(24, seen)
+    assert all(o is not None for o in outputs)
