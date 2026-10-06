@@ -70,10 +70,36 @@ def test_rescue_ignores_blob_inside_player_box(detector):
     assert detector._rescue_by_color(current, player_boxes=[(380, 250, 420, 350)]) is None
 
 
-def test_rescue_keeps_ball_just_outside_player_box(detector):
+def test_rescue_keeps_ball_just_outside_near_player_box(detector):
+    # Jogador próximo (caixa alta): margem pequena, bola a 30 px dele é aceita
     current = _push(detector, _frame((400, 300)), _frame((410, 300)))
-    far_box = [(300, 250, 380, 350)]  # termina 30 px antes da bola
-    assert detector._rescue_by_color(current, player_boxes=far_box) is not None
+    near_box = [(300, 100, 380, 500)]
+    assert detector._rescue_by_color(current, player_boxes=near_box) is not None
+
+
+def test_rescue_ignores_racket_reach_of_far_player(detector):
+    # Jogador do fundo (caixa baixa): raquete estendida a ~30 px da caixa
+    current = _push(detector, _frame((400, 300)), _frame((410, 300)))
+    far_box = [(350, 215, 380, 300)]
+    assert detector._rescue_by_color(current, player_boxes=far_box) is None
+
+
+def test_far_player_box_is_remembered_when_detector_loses_him(detector):
+    far_box = [(350, 215, 380, 300)]
+    detector._remember_far_boxes(far_box, HEIGHT)
+    current = _push(detector, _frame((400, 300)), _frame((410, 300)))
+    # quadro seguinte sem caixa nenhuma: ainda protegido pela memória
+    assert detector._rescue_by_color(current, player_boxes=[]) is None
+    # depois de a memória expirar, a bola volta a ser aceita
+    for _ in range(detector._far_boxes.maxlen):
+        detector._remember_far_boxes([], HEIGHT)
+    assert detector._rescue_by_color(current, player_boxes=[]) is not None
+
+
+def test_rescue_ignores_blob_far_from_predicted_position(detector):
+    # previsto (410, 300); mancha em movimento a 30 px dali é recusada
+    current = _push(detector, _frame((430, 300)), _frame((440, 300)))
+    assert detector._rescue_by_color(current) is None
 
 
 def test_rescue_never_starts_a_trajectory(detector):
@@ -106,6 +132,19 @@ def test_detect_uses_rescue_when_network_sees_nothing(detector):
     center, _ = detector.detect(_frame((410, 300)))
     assert center is not None and abs(center[0] - 410) <= 2
     assert detector.rescue_streak == 1 and detector.missed_frames == 0
+    assert detector.last_source == "cor"
+
+
+def test_rescued_marker_is_drawn_orange_and_network_marker_red(detector):
+    def marker_color(source):
+        detector.trajectory_pixels.appendleft((100, 100))
+        detector.last_source = source
+        canvas = np.zeros((200, 200, 3), np.uint8)
+        detector.draw_ball_trail(canvas)
+        return tuple(int(c) for c in canvas[100, 106])  # anel do círculo (raio 6)
+
+    assert marker_color("rede") == (0, 0, 255)
+    assert marker_color("cor") == (0, 140, 255)
 
 
 def test_color_rescue_can_be_disabled():
