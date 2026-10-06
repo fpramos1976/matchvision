@@ -74,9 +74,19 @@ class TrackNetBallDetector:
     RESCUE_MIN_BLOB_SATURATION = 110
     # Margem (px em vídeo de 1920 de largura) em volta da caixa do jogador
     PLAYER_ZONE_PAD = 15
+    # Caixa mais baixa que esta fração da altura do quadro = jogador do fundo,
+    # onde a raquete tem o tamanho aparente de uma bola. Para ele a zona de
+    # exclusão é proporcional à altura da caixa (alcance do braço + raquete).
+    FAR_PLAYER_MAX_HEIGHT = 0.2
+    FAR_PLAYER_REACH = 0.6
+    # Origem da última posição devolvida: "rede", "cor" ou None
+    last_source = None
     # Diferença média de brilho entre quadros consecutivos sobre a mancha:
     # bola em voo ~25-40; capim/folhagem parados ~0-2
     RESCUE_MIN_MOTION = 8
+    # Janela de busca em torno da posição prevista: base + fração da velocidade
+    RESCUE_BASE_RADIUS = 12
+    RESCUE_SPEED_FACTOR = 0.35
 
     def __init__(
         self,
@@ -136,6 +146,9 @@ class TrackNetBallDetector:
         self.max_rescue_streak = max(2, int(round(fps / 4.0)))
         self.rescue_streak = 0
         self.velocity = (0.0, 0.0)
+        # Caixas recentes do jogador do fundo: o detector de pessoas o perde
+        # por alguns quadros e, sem caixa, a raquete amarela vira "bola".
+        self._far_boxes = collections.deque(maxlen=max(3, int(round(fps / 2.0))))
 
     def _heatmap(self):
         step = self.frame_step
@@ -162,6 +175,8 @@ class TrackNetBallDetector:
     def detect(self, frame, homography=None, court_model=None, player_boxes=None):
         self.frames.append(frame)
         center = None
+        if self.color_rescue:
+            self._remember_far_boxes(player_boxes, frame.shape[0])
 
         if len(self.frames) == self.frames.maxlen:
             spot = self._ball_from_heatmap(self._heatmap())
@@ -194,23 +209,41 @@ class TrackNetBallDetector:
         else:
             self.missed_frames += 1
 
+        self.last_source = None if center is None else ("cor" if rescued else "rede")
         self.trajectory_pixels.appendleft(center)
         self.trajectory_world.appendleft(world_pos)
         return center, world_pos
 
-    def _in_player_zone(self, point, player_boxes, scale):
-        """True se o ponto está dentro da caixa de um jogador (com uma
-        pequena margem). Uma raquete amarela tem cor parecida com a da
-        bola e fica colada ao corpo; a bola colada ao jogador continua
-        sendo coberta pela própria rede."""
-        pad = self.PLAYER_ZONE_PAD * scale
-        for box in player_boxes or []:
-            try:
-                if hasattr(box, "xyxy"):
-                    box = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = (float(v) for v in box[:4])
-            except (AttributeError, TypeError, ValueError, IndexError):
-                continue
+    @staticmethod
+    def _box_xyxy(box):
+        try:
+            if hasattr(box, "xyxy"):
+                box = box.xyxy[0].cpu().numpy()
+            x1, y1, x2, y2 = (float(v) for v in box[:4])
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return None
+        return x1, y1, x2, y2
+
+    def _remember_far_boxes(self, player_boxes, frame_height):
+        boxes = (self._box_xyxy(b) for b in player_boxes or [])
+        limit = self.FAR_PLAYER_MAX_HEIGHT * frame_height
+        self._far_boxes.append([b for b in boxes if b and b[3] - b[1] < limit])
+
+    def _in_player_zone(self, point, player_boxes, scale, frame_height):
+        """True se o ponto está na zona de um jogador. Uma raquete amarela
+        tem cor e tamanho parecidos com os da bola e fica na mão do
+        jogador; a bola colada ao jogador próximo continua sendo coberta
+        pela própria rede, por isso a margem dele é pequena. Para o jogador
+        do fundo a zona acompanha o alcance da raquete e inclui as caixas
+        dos últimos quadros, já que o detector de pessoas o perde às vezes."""
+        near_pad = self.PLAYER_ZONE_PAD * scale
+        far_limit = self.FAR_PLAYER_MAX_HEIGHT * frame_height
+        boxes = [b for b in map(self._box_xyxy, player_boxes or []) if b]
+        for remembered in self._far_boxes:
+            boxes.extend(remembered)
+        for x1, y1, x2, y2 in boxes:
+            height = y2 - y1
+            pad = self.FAR_PLAYER_REACH * height if height < far_limit else near_pad
             if x1 - pad <= point[0] <= x2 + pad and y1 - pad <= point[1] <= y2 + pad:
                 return True
         return False
@@ -241,7 +274,11 @@ class TrackNetBallDetector:
         steps = self.missed_frames + 1
         px = self.last_center[0] + self.velocity[0] * steps
         py = self.last_center[1] + self.velocity[1] * steps
-        radius = int((30 + 22 * self.missed_frames) * scale) + 6
+        speed = float(np.hypot(*self.velocity))
+        radius = int(
+            (self.RESCUE_BASE_RADIUS * scale + self.RESCUE_SPEED_FACTOR * speed)
+            * (1 + 0.6 * self.missed_frames)
+        ) + 4
         x0, x1 = max(0, int(px) - radius), min(width, int(px) + radius)
         y0, y1 = max(0, int(py) - radius), min(height, int(py) + radius)
         if x1 - x0 < 4 or y1 - y0 < 4:
@@ -279,7 +316,7 @@ class TrackNetBallDetector:
             if np.median(hsv[:, :, 1][labels == k]) < self.RESCUE_MIN_BLOB_SATURATION:
                 continue
             cx, cy = centroids[k][0] + x0, centroids[k][1] + y0
-            if self._in_player_zone((cx, cy), player_boxes, scale):
+            if self._in_player_zone((cx, cy), player_boxes, scale, height):
                 continue
             if motion is not None:
                 r = int(np.sqrt(area / np.pi)) + 2
@@ -331,6 +368,8 @@ class TrackNetBallDetector:
                 cv2.line(frame, p1, p2, (0, 255, 255), 2, cv2.LINE_AA)
 
         if points and points[0] is not None:
-            cv2.circle(frame, points[0], 6, (0, 0, 255), 2)
+            # vermelho = rede, laranja = resgate por cor
+            color = (0, 140, 255) if self.last_source == "cor" else (0, 0, 255)
+            cv2.circle(frame, points[0], 6, color, 2)
             cv2.circle(frame, points[0], 2, (0, 255, 255), -1)
         return frame
