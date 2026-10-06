@@ -69,6 +69,14 @@ class TrackNetBallDetector:
 
     INPUT_WIDTH = 640
     INPUT_HEIGHT = 360
+    RESCUE_MIN_SATURATION = 100
+    # Saturação mediana mínima da mancha (a bola minúscula oscila entre ~110 e ~200)
+    RESCUE_MIN_BLOB_SATURATION = 110
+    # Margem (px em vídeo de 1920 de largura) em volta da caixa do jogador
+    PLAYER_ZONE_PAD = 15
+    # Diferença média de brilho entre quadros consecutivos sobre a mancha:
+    # bola em voo ~25-40; capim/folhagem parados ~0-2
+    RESCUE_MIN_MOTION = 8
 
     def __init__(
         self,
@@ -78,6 +86,7 @@ class TrackNetBallDetector:
         heatmap_threshold=127,
         max_jump=100,
         device=None,
+        color_rescue=True,
     ):
         if device is None:
             if torch.cuda.is_available():
@@ -116,6 +125,17 @@ class TrackNetBallDetector:
         self.trajectory_world = collections.deque(maxlen=max_buffer)
         self.last_center = None
         self.missed_frames = 0
+
+        # Resgate por cor: quando a rede perde a bola (fundo escuro, bola
+        # grande e colada ao jogador, fora do domínio de TV em que foi
+        # treinada), procura uma mancha amarela compacta só em volta da
+        # posição prevista pelo movimento. A janela e a sequência máxima de
+        # resgates impedem que o rastro "grude" numa raquete amarela.
+        self.color_rescue = color_rescue
+        self.rescue_window = max(2, int(round(fps / 3.0)))
+        self.max_rescue_streak = max(2, int(round(fps / 4.0)))
+        self.rescue_streak = 0
+        self.velocity = (0.0, 0.0)
 
     def _heatmap(self):
         step = self.frame_step
@@ -158,18 +178,119 @@ class TrackNetBallDetector:
             if jump > max_jump * (1 + self.missed_frames):
                 center = None
 
+        rescued = False
+        if center is None and self.color_rescue:
+            center = self._rescue_by_color(frame, player_boxes)
+            rescued = center is not None
+
         world_pos = None
         if center is not None:
             world_pos = self._to_world(center, homography)
             self._fill_gap(center, homography, max_jump)
+            self._update_velocity(center)
             self.last_center = center
             self.missed_frames = 0
+            self.rescue_streak = self.rescue_streak + 1 if rescued else 0
         else:
             self.missed_frames += 1
 
         self.trajectory_pixels.appendleft(center)
         self.trajectory_world.appendleft(world_pos)
         return center, world_pos
+
+    def _in_player_zone(self, point, player_boxes, scale):
+        """True se o ponto está dentro da caixa de um jogador (com uma
+        pequena margem). Uma raquete amarela tem cor parecida com a da
+        bola e fica colada ao corpo; a bola colada ao jogador continua
+        sendo coberta pela própria rede."""
+        pad = self.PLAYER_ZONE_PAD * scale
+        for box in player_boxes or []:
+            try:
+                if hasattr(box, "xyxy"):
+                    box = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = (float(v) for v in box[:4])
+            except (AttributeError, TypeError, ValueError, IndexError):
+                continue
+            if x1 - pad <= point[0] <= x2 + pad and y1 - pad <= point[1] <= y2 + pad:
+                return True
+        return False
+
+    def _update_velocity(self, center):
+        """Velocidade (px/quadro) da bola, suavizada, para prever onde ela
+        está nos quadros em que a rede não a vê."""
+        if self.last_center is None:
+            return
+        steps = self.missed_frames + 1
+        vx = (center[0] - self.last_center[0]) / steps
+        vy = (center[1] - self.last_center[1]) / steps
+        self.velocity = (0.5 * self.velocity[0] + 0.5 * vx, 0.5 * self.velocity[1] + 0.5 * vy)
+
+    def _rescue_by_color(self, frame, player_boxes=None):
+        """Procura a bola por cor perto da posição prevista. Só age logo
+        após uma detecção confirmada (nunca inicia uma trajetória) e por
+        poucos quadros seguidos."""
+        if (
+            self.last_center is None
+            or self.missed_frames >= self.rescue_window
+            or self.rescue_streak >= self.max_rescue_streak
+        ):
+            return None
+
+        height, width = frame.shape[:2]
+        scale = width / 1920.0
+        steps = self.missed_frames + 1
+        px = self.last_center[0] + self.velocity[0] * steps
+        py = self.last_center[1] + self.velocity[1] * steps
+        radius = int((30 + 22 * self.missed_frames) * scale) + 6
+        x0, x1 = max(0, int(px) - radius), min(width, int(px) + radius)
+        y0, y1 = max(0, int(py) - radius), min(height, int(py) + radius)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return None
+
+        hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+        # Filtro de cor propositalmente frouxo (a bola minúscula perde
+        # saturação ao se mover): o saibro fica de fora pelo matiz (H < 17)
+        # e o que é amarelo mas não é bola cai nos filtros abaixo, já que a
+        # saturação NÃO separa bola de raquete amarelo-esverdeada: raquete
+        # (caixa do jogador) e capim seco (sem movimento entre quadros).
+        mask = cv2.inRange(hsv, (17, self.RESCUE_MIN_SATURATION, 120), (30, 255, 255))
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        )
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
+
+        # Diferença entre este quadro e o anterior, só na região de busca
+        motion = None
+        if len(self.frames) >= 2:
+            previous = self.frames[-2][y0:y1, x0:x1]
+            motion = cv2.absdiff(
+                cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY),
+                cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY),
+            )
+
+        min_area, max_area = 5 * scale * scale, 500 * scale * scale
+        best, best_dist = None, None
+        for k in range(1, count):
+            w = stats[k, cv2.CC_STAT_WIDTH]
+            h = stats[k, cv2.CC_STAT_HEIGHT]
+            area = stats[k, cv2.CC_STAT_AREA]
+            if not min_area <= area <= max_area or max(w, h) > 2.6 * max(1, min(w, h)):
+                continue
+            if np.median(hsv[:, :, 1][labels == k]) < self.RESCUE_MIN_BLOB_SATURATION:
+                continue
+            cx, cy = centroids[k][0] + x0, centroids[k][1] + y0
+            if self._in_player_zone((cx, cy), player_boxes, scale):
+                continue
+            if motion is not None:
+                r = int(np.sqrt(area / np.pi)) + 2
+                mx, my = int(centroids[k][0]), int(centroids[k][1])
+                window = motion[max(0, my - r): my + r + 1, max(0, mx - r): mx + r + 1]
+                if window.mean() < self.RESCUE_MIN_MOTION:
+                    continue
+            dist = np.hypot(cx - px, cy - py)
+            if dist <= radius and (best is None or dist < best_dist):
+                best, best_dist = (int(round(cx)), int(round(cy))), dist
+        return best
 
     @staticmethod
     def _to_world(point, homography):
