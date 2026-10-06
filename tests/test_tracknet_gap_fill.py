@@ -19,6 +19,11 @@ def make_detector(fps, seen):
     detector.trajectory_world = collections.deque(maxlen=60)
     detector.last_center = None
     detector.missed_frames = 0
+    # Estado do resgate por cor (desligado: estes testes cobrem só o
+    # preenchimento de buracos a partir do que a rede vê)
+    detector.color_rescue = False
+    detector.velocity = (0.0, 0.0)
+    detector.rescue_streak = 0
     detector._heatmap = lambda: None
     spots = iter(seen)
     # Coordenadas injetadas já em pixels de 640x360 (frame de mesmo tamanho)
