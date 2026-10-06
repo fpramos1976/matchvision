@@ -87,6 +87,13 @@ class TrackNetBallDetector:
     # Janela de busca em torno da posição prevista: base + fração da velocidade
     RESCUE_BASE_RADIUS = 12
     RESCUE_SPEED_FACTOR = 0.35
+    # Bola fora de jogo: ficou STATIONARY_SECONDS num raio de
+    # STATIONARY_RADIUS e andou menos de STATIONARY_SPEED px/quadro (px num
+    # vídeo de 1920 de largura). Com 0,5-0,75 s a bola em jogo perto do topo
+    # da trajetória também era apagada (tennis_1.mp4, quadros 76 e 144-146).
+    STATIONARY_RADIUS = 40
+    STATIONARY_SPEED = 4
+    STATIONARY_SECONDS = 1.0
 
     def __init__(
         self,
@@ -149,6 +156,10 @@ class TrackNetBallDetector:
         # Caixas recentes do jogador do fundo: o detector de pessoas o perde
         # por alguns quadros e, sem caixa, a raquete amarela vira "bola".
         self._far_boxes = collections.deque(maxlen=max(3, int(round(fps / 2.0))))
+        # Posições do último ~1 s, para reconhecer bola fora de jogo
+        self._recent = collections.deque(
+            maxlen=max(6, int(round(fps * self.STATIONARY_SECONDS)))
+        )
 
     def _heatmap(self):
         step = self.frame_step
@@ -209,10 +220,35 @@ class TrackNetBallDetector:
         else:
             self.missed_frames += 1
 
+        # Bola fora de jogo (parada ou rolando no chão): a rede e o resgate
+        # a encontram (tennis_2.mp4, quadros 2-53), mas em jogo a bola nunca
+        # fica ~1 s praticamente no mesmo lugar. Mantém o estado interno,
+        # mas não marca nem desenha.
+        self._recent.append(center)
+        if center is not None and self._is_stationary(frame.shape[1]):
+            center, world_pos = None, None
+
         self.last_source = None if center is None else ("cor" if rescued else "rede")
         self.trajectory_pixels.appendleft(center)
         self.trajectory_world.appendleft(world_pos)
         return center, world_pos
+
+    def _is_stationary(self, frame_width):
+        """True quando, no último ~1 s, a bola ficou num raio pequeno E
+        andou devagar (bola rolando no chão ~2-3 px/quadro; em jogo, mesmo
+        longe da câmera, ~9 px/quadro ou mais)."""
+        indexed = [(i, p) for i, p in enumerate(self._recent) if p is not None]
+        if len(self._recent) < self._recent.maxlen or len(indexed) < 0.6 * self._recent.maxlen:
+            return False
+        scale = frame_width / 1920.0
+        points = [p for _, p in indexed]
+        cx = sum(p[0] for p in points) / len(points)
+        cy = sum(p[1] for p in points) / len(points)
+        if any(np.hypot(p[0] - cx, p[1] - cy) > self.STATIONARY_RADIUS * scale for p in points):
+            return False
+        (i0, first), (i1, last) = indexed[0], indexed[-1]
+        speed = np.hypot(last[0] - first[0], last[1] - first[1]) / max(1, i1 - i0)
+        return speed < self.STATIONARY_SPEED * scale
 
     @staticmethod
     def _box_xyxy(box):
