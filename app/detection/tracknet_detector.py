@@ -72,13 +72,15 @@ class TrackNetBallDetector:
     RESCUE_MIN_SATURATION = 100
     # Saturação mediana mínima da mancha (a bola minúscula oscila entre ~110 e ~200)
     RESCUE_MIN_BLOB_SATURATION = 110
-    # Margem (px em vídeo de 1920 de largura) em volta da caixa do jogador
-    PLAYER_ZONE_PAD = 15
-    # Caixa mais baixa que esta fração da altura do quadro = jogador do fundo,
-    # onde a raquete tem o tamanho aparente de uma bola. Para ele a zona de
-    # exclusão é proporcional à altura da caixa (alcance do braço + raquete).
+    # Com um só jogador no quadro, caixa mais baixa que esta fração da altura
+    # do quadro = jogador do fundo, onde a raquete tem o tamanho aparente de
+    # uma bola. Para ele a zona de exclusão é proporcional à altura da caixa
+    # (alcance do braço + raquete).
     FAR_PLAYER_MAX_HEIGHT = 0.2
     FAR_PLAYER_REACH = 0.6
+    # Com 2+ jogadores no quadro: do fundo é quem tem altura menor que esta
+    # fração da altura do maior jogador
+    FAR_PLAYER_RELATIVE_HEIGHT = 0.6
     # Origem da última posição devolvida: "rede", "cor" ou None
     last_source = None
     # Diferença média de brilho entre quadros consecutivos sobre a mancha:
@@ -260,26 +262,36 @@ class TrackNetBallDetector:
             return None
         return x1, y1, x2, y2
 
-    def _remember_far_boxes(self, player_boxes, frame_height):
-        boxes = (self._box_xyxy(b) for b in player_boxes or [])
-        limit = self.FAR_PLAYER_MAX_HEIGHT * frame_height
-        self._far_boxes.append([b for b in boxes if b and b[3] - b[1] < limit])
-
-    def _in_player_zone(self, point, player_boxes, scale, frame_height):
-        """True se o ponto está na zona de um jogador. Uma raquete amarela
-        tem cor e tamanho parecidos com os da bola e fica na mão do
-        jogador; a bola colada ao jogador próximo continua sendo coberta
-        pela própria rede, por isso a margem dele é pequena. Para o jogador
-        do fundo a zona acompanha o alcance da raquete e inclui as caixas
-        dos últimos quadros, já que o detector de pessoas o perde às vezes."""
-        near_pad = self.PLAYER_ZONE_PAD * scale
-        far_limit = self.FAR_PLAYER_MAX_HEIGHT * frame_height
+    def _far_player_boxes(self, player_boxes, frame_height):
+        """Caixas do(s) jogador(es) do fundo. Com mais de um jogador no
+        quadro, é do fundo quem aparece bem menor que o maior deles; a
+        altura absoluta falha com a câmera longe da quadra (trecho_hd.mp4:
+        o jogador de perto ocupa só ~15% da altura e era tratado como do
+        fundo). Com um jogador só, vale o limite absoluto."""
         boxes = [b for b in map(self._box_xyxy, player_boxes or []) if b]
+        if len(boxes) >= 2:
+            tallest = max(b[3] - b[1] for b in boxes)
+            return [b for b in boxes if b[3] - b[1] < self.FAR_PLAYER_RELATIVE_HEIGHT * tallest]
+        limit = self.FAR_PLAYER_MAX_HEIGHT * frame_height
+        return [b for b in boxes if b[3] - b[1] < limit]
+
+    def _remember_far_boxes(self, player_boxes, frame_height):
+        self._far_boxes.append(self._far_player_boxes(player_boxes, frame_height))
+
+    def _in_player_zone(self, point, player_boxes, frame_height):
+        """True se o ponto está na zona do jogador do fundo, onde a raquete
+        amarela tem cor e tamanho parecidos com os da bola. A zona acompanha
+        o alcance da raquete e inclui as caixas dos últimos quadros, já que o
+        detector de pessoas o perde às vezes.
+
+        O jogador de perto não é excluído: a rede perde a bola colada a ele
+        (trecho_hd.mp4, golpes e voleios) e é justamente aí que o resgate
+        ajuda; a raquete dele aparece grande demais para passar por bola."""
+        boxes = self._far_player_boxes(player_boxes, frame_height)
         for remembered in self._far_boxes:
             boxes.extend(remembered)
         for x1, y1, x2, y2 in boxes:
-            height = y2 - y1
-            pad = self.FAR_PLAYER_REACH * height if height < far_limit else near_pad
+            pad = self.FAR_PLAYER_REACH * (y2 - y1)
             if x1 - pad <= point[0] <= x2 + pad and y1 - pad <= point[1] <= y2 + pad:
                 return True
         return False
@@ -322,11 +334,12 @@ class TrackNetBallDetector:
 
         hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
         # Filtro de cor propositalmente frouxo (a bola minúscula perde
-        # saturação ao se mover): o saibro fica de fora pelo matiz (H < 17)
+        # saturação ao se mover; o matiz vai de ~16-24 no saibro do
+        # tennis_1/2 a ~22-42 no trecho_hd): o saibro fica de fora (H < 17)
         # e o que é amarelo mas não é bola cai nos filtros abaixo, já que a
         # saturação NÃO separa bola de raquete amarelo-esverdeada: raquete
         # (caixa do jogador) e capim seco (sem movimento entre quadros).
-        mask = cv2.inRange(hsv, (17, self.RESCUE_MIN_SATURATION, 120), (30, 255, 255))
+        mask = cv2.inRange(hsv, (17, self.RESCUE_MIN_SATURATION, 120), (40, 255, 255))
         mask = cv2.morphologyEx(
             mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         )
@@ -352,7 +365,7 @@ class TrackNetBallDetector:
             if np.median(hsv[:, :, 1][labels == k]) < self.RESCUE_MIN_BLOB_SATURATION:
                 continue
             cx, cy = centroids[k][0] + x0, centroids[k][1] + y0
-            if self._in_player_zone((cx, cy), player_boxes, scale, height):
+            if self._in_player_zone((cx, cy), player_boxes, height):
                 continue
             if motion is not None:
                 r = int(np.sqrt(area / np.pi)) + 2

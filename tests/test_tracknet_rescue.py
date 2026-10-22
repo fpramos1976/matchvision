@@ -159,3 +159,33 @@ def test_color_rescue_can_be_disabled():
     det.frames.append(_frame((400, 300)))
     center, _ = det.detect(_frame((410, 300)))
     assert center is None
+
+
+def test_rescue_finds_ball_inside_near_player_box_in_wide_shot(detector):
+    # Câmera longe da quadra (trecho_hd.mp4): os dois jogadores têm caixa
+    # baixa em relação ao quadro, mas o de perto é bem maior que o do fundo.
+    # A bola colada ao jogador de perto deve ser resgatada.
+    near_box = (390, 220, 450, 320)  # 100 px: abaixo de 20% da altura do quadro
+    far_box = (700, 120, 712, 150)
+    current = _push(detector, _frame((400, 300)), _frame((410, 300)))
+    found = detector._rescue_by_color(current, player_boxes=[near_box, far_box])
+    assert found is not None
+    assert abs(found[0] - 410) <= 2 and abs(found[1] - 300) <= 2
+
+
+def test_rescue_still_ignores_far_player_racket_with_two_players(detector):
+    near_box = (100, 100, 200, 500)
+    far_box = (350, 215, 380, 300)
+    current = _push(detector, _frame((400, 300)), _frame((410, 300)))
+    assert detector._rescue_by_color(current, player_boxes=[near_box, far_box]) is None
+
+
+def test_rescue_accepts_greenish_yellow_ball(detector):
+    # No trecho_hd.mp4 a bola chega a matiz ~35-42 (amarelo-esverdeado)
+    greenish = _bgr(35, 190, 230)
+    previous = np.full((HEIGHT, WIDTH, 3), CLAY, dtype=np.uint8)
+    current = previous.copy()
+    cv2.circle(previous, (400, 300), 4, greenish, -1)
+    cv2.circle(current, (410, 300), 4, greenish, -1)
+    _push(detector, previous, current)
+    assert detector._rescue_by_color(current) is not None
