@@ -93,6 +93,15 @@ class TrackNetBallDetector:
     # STATIONARY_RADIUS e andou menos de STATIONARY_SPEED px/quadro (px num
     # vídeo de 1920 de largura). Com 0,5-0,75 s a bola em jogo perto do topo
     # da trajetória também era apagada (tennis_1.mp4, quadros 76 e 144-146).
+    # Velocidade máxima plausível da bola na imagem (px/s num vídeo de 1920
+    # px de largura). Nos quadros conferidos a mais rápida chegou a ~3.200
+    # px/s (tennis_2, bola perto da câmera); a 24 fps o limite equivale aos
+    # 150 px/quadro de antes, a 60 fps cai para 60 px/quadro.
+    MAX_BALL_SPEED = 3600
+    # Ponto isolado no rastro: salta mais que SPIKE_MIN_JUMP x o salto máximo
+    # para os dois vizinhos, que ficam perto um do outro
+    SPIKE_MIN_JUMP = 0.5
+    SPIKE_RETURN_RATIO = 0.6
     STATIONARY_RADIUS = 40
     STATIONARY_SPEED = 4
     STATIONARY_SECONDS = 1.0
@@ -132,6 +141,7 @@ class TrackNetBallDetector:
         # como falso positivo. O valor é em pixels de um vídeo 1280 px de
         # largura e é escalado para a resolução real.
         self.max_jump = max_jump
+        self.fps = fps if fps and fps > 0 else 30
 
         # Buracos curtos na trajetória (a rede perde a bola colada ao
         # jogador) são preenchidos por interpolação quando a bola
@@ -139,6 +149,7 @@ class TrackNetBallDetector:
         # trecho_hd.mp4 isso levou de 27 para 38 acertos em 46 quadros
         # conferidos, sem nenhuma posição errada.
         self.max_gap = max(1, int(round(fps / 6.0)))
+        self._pending_fill = None
 
         self.trajectory_pixels = collections.deque(maxlen=max_buffer)
         self.trajectory_world = collections.deque(maxlen=max_buffer)
@@ -200,7 +211,15 @@ class TrackNetBallDetector:
                     int(round(spot[1] * height / self.INPUT_HEIGHT)),
                 )
 
-        max_jump = self.max_jump * frame.shape[1] / 1280.0
+        # Salto máximo entre quadros: o menor entre o limite por quadro e a
+        # velocidade máxima da bola convertida para o fps do vídeo. Sem o
+        # segundo, em 60 fps o rastro aceitava 150 px/quadro (9.000 px/s) e
+        # ligava em linha reta pontos que não eram a mesma bola.
+        width = frame.shape[1]
+        max_jump = min(
+            self.max_jump * width / 1280.0,
+            self.MAX_BALL_SPEED * width / 1920.0 / self.fps,
+        )
         if center is not None and self.last_center is not None and self.missed_frames < 4:
             jump = np.hypot(center[0] - self.last_center[0], center[1] - self.last_center[1])
             if jump > max_jump * (1 + self.missed_frames):
@@ -233,7 +252,27 @@ class TrackNetBallDetector:
         self.last_source = None if center is None else ("cor" if rescued else "rede")
         self.trajectory_pixels.appendleft(center)
         self.trajectory_world.appendleft(world_pos)
+        self._confirm_pending_fill(center, max_jump)
+        self._remove_spike(max_jump)
         return center, world_pos
+
+    def _remove_spike(self, max_jump):
+        """Tira do rastro um ponto isolado que salta para longe e volta: no
+        quadro anterior a rede marcou outra coisa (tennis_2, quadros 169 e
+        236) e o rastro desenhava um "V" que não é a bola. Só o histórico
+        muda; a posição ao vivo daquele quadro já foi devolvida."""
+        if len(self.trajectory_pixels) < 3:
+            return
+        c, b, a = self.trajectory_pixels[0], self.trajectory_pixels[1], self.trajectory_pixels[2]
+        if a is None or b is None or c is None:
+            return
+        d_ab = np.hypot(b[0] - a[0], b[1] - a[1])
+        d_bc = np.hypot(c[0] - b[0], c[1] - b[1])
+        d_ac = np.hypot(c[0] - a[0], c[1] - a[1])
+        threshold = self.SPIKE_MIN_JUMP * max_jump
+        if d_ab > threshold and d_bc > threshold and d_ac < self.SPIKE_RETURN_RATIO * (d_ab + d_bc) / 2:
+            self.trajectory_pixels[1] = None
+            self.trajectory_world[1] = None
 
     def _is_stationary(self, frame_width):
         """True quando, no último ~1 s, a bola ficou num raio pequeno E
@@ -390,24 +429,65 @@ class TrackNetBallDetector:
     def _fill_gap(self, center, homography, max_jump):
         """Se a bola reaparece depois de poucos frames sumida e perto de
         onde estava, preenche o rastro (pixels e mundo) desses frames por
-        interpolação linear. Não atrasa a saída: só o histórico muda."""
+        interpolação linear. Não atrasa a saída: só o histórico muda.
+
+        O preenchimento fica pendente até o quadro seguinte confirmar o
+        ponto que reapareceu (outra detecção logo ao lado): um ponto falso
+        e isolado da rede (trecho_hd, quadro 93, na parede de um prédio)
+        era ligado em linha reta à bola de 10 quadros antes."""
         gap = self.missed_frames
         if self.last_center is None or not 0 < gap <= self.max_gap:
             return
         if gap > len(self.trajectory_pixels) - 1:
             return
-        x0, y0 = self.last_center
-        if np.hypot(center[0] - x0, center[1] - y0) > max_jump * (gap + 1):
+        # Só parte de uma posição que foi mostrada: a bola parada/fora de
+        # jogo continua como last_center internamente e, sem isto, o rastro
+        # ligava a bola rolando no chão à bola do saque (tennis_2, 54-57).
+        if self.trajectory_pixels[gap] is None:
             return
-        # trajectory_pixels[0] é o frame anterior; [gap] é a última detecção
+        x0, y0 = self.last_center
+        distance = np.hypot(center[0] - x0, center[1] - y0)
+        if distance > max_jump * (gap + 1):
+            return
+        if distance <= max_jump:
+            # Bola quase no mesmo lugar: preenche já, sem esperar confirmação
+            self._interpolate(gap, (x0, y0), center, homography, offset=1)
+            return
+        # Longe da última posição: idade 0 = registrado neste quadro;
+        # confirmado (ou descartado) no próximo
+        self._pending_fill = [0, gap, (x0, y0), center, homography]
+
+    def _interpolate(self, gap, start, end, homography, offset):
+        """Preenche os `gap` quadros entre `start` e `end`; `offset` é o
+        índice no rastro do quadro logo antes de `end`."""
+        x0, y0 = start
         for i in range(gap):
             t = (gap - i) / (gap + 1.0)
             point = (
-                int(round(x0 + (center[0] - x0) * t)),
-                int(round(y0 + (center[1] - y0) * t)),
+                int(round(x0 + (end[0] - x0) * t)),
+                int(round(y0 + (end[1] - y0) * t)),
             )
-            self.trajectory_pixels[i] = point
-            self.trajectory_world[i] = self._to_world(point, homography)
+            self.trajectory_pixels[i + offset - 1] = point
+            self.trajectory_world[i + offset - 1] = self._to_world(point, homography)
+
+    def _confirm_pending_fill(self, center, max_jump):
+        """Chamado depois de registrar o quadro atual no rastro."""
+        if self._pending_fill is None:
+            return
+        if self._pending_fill[0] == 0:
+            self._pending_fill[0] = 1
+            return
+        pending, self._pending_fill = self._pending_fill, None
+        if center is None:
+            return
+        _, gap, (x0, y0), reappeared, homography = pending
+        if np.hypot(center[0] - reappeared[0], center[1] - reappeared[1]) > max_jump:
+            return
+        # Agora trajectory_pixels[0] é o quadro atual, [1] o ponto que
+        # reapareceu e [gap + 1] a última detecção antes do buraco.
+        if gap + 1 > len(self.trajectory_pixels) - 1:
+            return
+        self._interpolate(gap, (x0, y0), reappeared, homography, offset=3)
 
     def draw_ball_trail(self, frame):
         """Desenha a linha amarela de trajetória e o marcador da bola."""
